@@ -61,7 +61,10 @@ async fn main() -> Result<()> {
     init_logging()?;
 
     info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║       Funding Fee Farmer v{} - MVP Paper Trading        ║", env!("CARGO_PKG_VERSION"));
+    info!(
+        "║       Funding Fee Farmer v{} - MVP Paper Trading        ║",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("╚════════════════════════════════════════════════════════════╝");
 
     // Determine trading mode from environment
@@ -84,32 +87,54 @@ async fn main() -> Result<()> {
         config.risk.clone(),
         config.execution.default_leverage,
     );
-    let executor = OrderExecutor::new(config.execution.clone());
+    let mut executor = OrderExecutor::new(config.execution.clone());
     let rebalancer = HedgeRebalancer::new(RebalanceConfig::default());
 
     // Initialize clients
     // For MVP mock trading, we create a real client only if credentials are available
-    let binance_config = crate::config::BinanceConfig {
+    let binance_config = funding_fee_farmer::config::BinanceConfig {
         api_key: std::env::var("BINANCE_API_KEY").unwrap_or_default(),
         secret_key: std::env::var("BINANCE_SECRET_KEY").unwrap_or_default(),
         testnet: false,
     };
 
-    let real_client = if !binance_config.api_key.is_empty() {
-        match BinanceClient::new(&binance_config) {
-            Ok(client) => Some(client),
-            Err(e) => {
-                warn!("Failed to create real client: {}. Running mock-only mode.", e);
-                None
+    let real_client = match BinanceClient::new(&binance_config) {
+        Ok(client) => {
+            if binance_config.api_key.is_empty() {
+                info!("⚠️  No API keys provided. Running in Read-Only/Mock mode.");
             }
+            client
         }
-    } else {
-        info!("No API credentials provided. Running mock-only mode.");
-        None
+        Err(e) => {
+            error!("Failed to create Binance client: {}", e);
+            return Err(e);
+        }
     };
 
     let mock_client = MockBinanceClient::new(dec!(10000)); // $10k paper trading
     let mut drawdown_tracker = DrawdownTracker::new(config.risk.max_drawdown, dec!(10000));
+
+    // Initialize precisions
+    match real_client.get_futures_exchange_info().await {
+        Ok(info) => {
+            let precisions = info
+                .symbols
+                .into_iter()
+                .map(|s| (s.symbol, s.quantity_precision))
+                .collect();
+            executor.set_precisions(precisions);
+            info!("✅ [INIT] Futures exchange info loaded");
+        }
+        Err(e) => {
+            warn!("⚠️  [INIT] Failed to load exchange info: {}", e);
+            if trading_mode == TradingMode::Live {
+                // In Live mode, we might want to panic, but for now we warn
+                error!(
+                    "❌ LIVE Mode warning: Exchange info failed. Precision defaults will be used."
+                );
+            }
+        }
+    }
 
     // Metrics tracking
     let mut metrics = AppMetrics::default();
@@ -144,10 +169,7 @@ async fn main() -> Result<()> {
 
         let qualified_pairs = match scan_result {
             Ok(pairs) => {
-                info!(
-                    "📊 [SCAN] Found {} qualified pairs",
-                    pairs.len()
-                );
+                info!("📊 [SCAN] Found {} qualified pairs", pairs.len());
                 for (i, pair) in pairs.iter().take(5).enumerate() {
                     info!(
                         "   #{}: {} | Funding: {:.4}% | Volume: ${:.0}M | Score: {:.2}",
@@ -180,7 +202,10 @@ async fn main() -> Result<()> {
                     .map(|p| (p.symbol, p.futures_qty))
                     .collect()
             } else {
-                HashMap::new() // TODO: Fetch from real client
+                match fetch_real_positions(&real_client).await {
+                    Ok(pos) => pos,
+                    Err(_) => HashMap::new(),
+                }
             };
 
             let mock_state = mock_client.get_state().await;
@@ -212,7 +237,9 @@ async fn main() -> Result<()> {
                         .iter()
                         .map(|p| (p.symbol.clone(), p.funding_rate))
                         .collect();
-                    mock_client.update_market_data(funding_rates, prices.clone()).await;
+                    mock_client
+                        .update_market_data(funding_rates, prices.clone())
+                        .await;
 
                     for alloc in allocations.iter().take(2) {
                         // Limit to top 2 for MVP
@@ -282,6 +309,36 @@ async fn main() -> Result<()> {
                         );
                         metrics.positions_entered += 1;
                     }
+                } else {
+                    // LIVE TRADING EXECUTION
+                    let prices = fetch_prices(&real_client, &qualified_pairs).await;
+
+                    for alloc in &allocations {
+                        let price = prices.get(&alloc.symbol).copied().unwrap_or(dec!(0));
+                        if price == Decimal::ZERO {
+                            warn!("Skipping {} due to missing price", alloc.symbol);
+                            continue;
+                        }
+
+                        match executor.enter_position(&real_client, alloc, price).await {
+                            Ok(result) => {
+                                if result.success {
+                                    info!("✅ [EXECUTE] Entered position for {}", result.symbol);
+                                    metrics.positions_entered += 1;
+                                } else {
+                                    error!(
+                                        "❌ [EXECUTE] Failed to enter {}: {:?}",
+                                        result.symbol, result.error
+                                    );
+                                    metrics.errors_count += 1;
+                                }
+                            }
+                            Err(e) => {
+                                error!("❌ [EXECUTE] Error executing {}: {}", alloc.symbol, e);
+                                metrics.errors_count += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -292,7 +349,10 @@ async fn main() -> Result<()> {
         if trading_mode == TradingMode::Mock {
             let positions = mock_client.get_delta_neutral_positions().await;
             if !positions.is_empty() {
-                debug!("⚖️  [REBALANCE] Checking {} positions for delta drift", positions.len());
+                debug!(
+                    "⚖️  [REBALANCE] Checking {} positions for delta drift",
+                    positions.len()
+                );
 
                 let funding_rates: HashMap<String, Decimal> = qualified_pairs
                     .iter()
@@ -305,17 +365,11 @@ async fn main() -> Result<()> {
                         .get(&position.symbol)
                         .copied()
                         .unwrap_or(Decimal::ZERO);
-                    let price = prices
-                        .get(&position.symbol)
-                        .copied()
-                        .unwrap_or(dec!(50000));
+                    let price = prices.get(&position.symbol).copied().unwrap_or(dec!(50000));
 
                     let action = rebalancer.analyze_position(position, funding_rate, price);
 
-                    if !matches!(
-                        action,
-                        funding_fee_farmer::strategy::RebalanceAction::None
-                    ) {
+                    if !matches!(action, funding_fee_farmer::strategy::RebalanceAction::None) {
                         warn!(
                             "⚖️  [REBALANCE] Action needed for {}: {:?}",
                             position.symbol, action
@@ -363,8 +417,27 @@ async fn main() -> Result<()> {
 
             // Log status every 5 minutes
             if (Utc::now() - last_status_log).num_minutes() >= 5 {
-                log_status(&metrics, &state, realized_pnl, unrealized_pnl, &drawdown_tracker);
+                log_status(
+                    &metrics,
+                    &state,
+                    realized_pnl,
+                    unrealized_pnl,
+                    &drawdown_tracker,
+                );
                 last_status_log = Utc::now();
+            }
+        } else {
+            // Live Mode Risk Check
+            if let Ok(balances) = real_client.get_account_balance().await {
+                let total_equity: Decimal = balances
+                    .iter()
+                    .map(|b| b.wallet_balance + b.unrealized_profit)
+                    .sum();
+
+                if drawdown_tracker.update(total_equity) {
+                    error!("🚨 [RISK] Maximum drawdown exceeded! HALTING TRADING.");
+                    break;
+                }
             }
         }
 
@@ -381,7 +454,13 @@ async fn main() -> Result<()> {
     if trading_mode == TradingMode::Mock {
         let state = mock_client.get_state().await;
         let (realized_pnl, unrealized_pnl) = mock_client.calculate_pnl().await;
-        log_status(&metrics, &state, realized_pnl, unrealized_pnl, &drawdown_tracker);
+        log_status(
+            &metrics,
+            &state,
+            realized_pnl,
+            unrealized_pnl,
+            &drawdown_tracker,
+        );
     }
 
     info!("👋 Funding Fee Farmer shutdown complete");
@@ -423,14 +502,50 @@ fn init_logging() -> Result<()> {
 /// Log configuration on startup.
 fn log_config(config: &Config) {
     info!("📋 Configuration:");
-    info!("   Capital Utilization: {:.0}%", config.capital.max_utilization * dec!(100));
-    info!("   Reserve Buffer: {:.0}%", config.capital.reserve_buffer * dec!(100));
-    info!("   Min Position Size: ${}", config.capital.min_position_size);
-    info!("   Max Drawdown: {:.0}%", config.risk.max_drawdown * dec!(100));
+    info!(
+        "   Capital Utilization: {:.0}%",
+        config.capital.max_utilization * dec!(100)
+    );
+    info!(
+        "   Reserve Buffer: {:.0}%",
+        config.capital.reserve_buffer * dec!(100)
+    );
+    info!(
+        "   Min Position Size: ${}",
+        config.capital.min_position_size
+    );
+    info!(
+        "   Max Drawdown: {:.0}%",
+        config.risk.max_drawdown * dec!(100)
+    );
     info!("   Min Margin Ratio: {}x", config.risk.min_margin_ratio);
-    info!("   Default Leverage: {}x", config.execution.default_leverage);
-    info!("   Min Funding Rate: {:.4}%", config.pair_selection.min_funding_rate * dec!(100));
-    info!("   Min Volume 24h: ${:.0}M", config.pair_selection.min_volume_24h / dec!(1_000_000));
+    info!(
+        "   Default Leverage: {}x",
+        config.execution.default_leverage
+    );
+    info!(
+        "   Min Funding Rate: {:.4}%",
+        config.pair_selection.min_funding_rate * dec!(100)
+    );
+    info!(
+        "   Min Volume 24h: ${:.0}M",
+        config.pair_selection.min_volume_24h / dec!(1_000_000)
+    );
+}
+
+/// Fetch real positions.
+async fn fetch_real_positions(client: &BinanceClient) -> Result<HashMap<String, Decimal>> {
+    match client.get_positions().await {
+        Ok(positions) => Ok(positions
+            .into_iter()
+            .filter(|p| p.position_amt != Decimal::ZERO)
+            .map(|p| (p.symbol, p.position_amt))
+            .collect()),
+        Err(e) => {
+            error!("Failed to fetch real positions: {}", e);
+            Err(e.into())
+        }
+    }
 }
 
 /// Fetch current prices from real client.
@@ -469,33 +584,93 @@ fn log_status(
     info!("╔════════════════════════════════════════════════════════════╗");
     info!("║                    STATUS REPORT                           ║");
     info!("╠════════════════════════════════════════════════════════════╣");
-    info!("║ Runtime: {}h {}m                                           ", hours, minutes);
+    info!(
+        "║ Runtime: {}h {}m                                           ",
+        hours, minutes
+    );
     info!("╠════════════════════════════════════════════════════════════╣");
     info!("║ 💰 ACCOUNT                                                 ║");
-    info!("║    Initial Balance:     ${:>12.2}                     ", state.initial_balance);
-    info!("║    Current Balance:     ${:>12.2}                     ", state.balance);
-    info!("║    Unrealized PnL:      ${:>12.2}                     ", unrealized_pnl);
-    info!("║    Total Equity:        ${:>12.2}                     ", state.balance + unrealized_pnl);
+    info!(
+        "║    Initial Balance:     ${:>12.2}                     ",
+        state.initial_balance
+    );
+    info!(
+        "║    Current Balance:     ${:>12.2}                     ",
+        state.balance
+    );
+    info!(
+        "║    Unrealized PnL:      ${:>12.2}                     ",
+        unrealized_pnl
+    );
+    info!(
+        "║    Total Equity:        ${:>12.2}                     ",
+        state.balance + unrealized_pnl
+    );
     info!("╠════════════════════════════════════════════════════════════╣");
     info!("║ 📊 P&L BREAKDOWN                                          ║");
-    info!("║    Funding Received:    ${:>12.4}                     ", state.total_funding_received);
-    info!("║    Trading Fees:       -${:>12.4}                     ", state.total_trading_fees);
-    info!("║    Borrow Interest:    -${:>12.4}                     ", state.total_borrow_interest);
-    info!("║    Realized PnL:        ${:>12.4}                     ", realized_pnl);
+    info!(
+        "║    Funding Received:    ${:>12.4}                     ",
+        state.total_funding_received
+    );
+    info!(
+        "║    Trading Fees:       -${:>12.4}                     ",
+        state.total_trading_fees
+    );
+    info!(
+        "║    Borrow Interest:    -${:>12.4}                     ",
+        state.total_borrow_interest
+    );
+    info!(
+        "║    Realized PnL:        ${:>12.4}                     ",
+        realized_pnl
+    );
     info!("╠════════════════════════════════════════════════════════════╣");
     info!("║ 📈 ACTIVITY                                                ║");
-    info!("║    Scans:              {:>6}                              ", metrics.scan_count);
-    info!("║    Opportunities:      {:>6}                              ", metrics.opportunities_found);
-    info!("║    Positions Entered:  {:>6}                              ", metrics.positions_entered);
-    info!("║    Rebalances:         {:>6}                              ", metrics.rebalances_triggered);
-    info!("║    Funding Collections:{:>6}                              ", metrics.funding_collections);
-    info!("║    Orders Placed:      {:>6}                              ", state.order_count);
-    info!("║    Errors:             {:>6}                              ", metrics.errors_count);
+    info!(
+        "║    Scans:              {:>6}                              ",
+        metrics.scan_count
+    );
+    info!(
+        "║    Opportunities:      {:>6}                              ",
+        metrics.opportunities_found
+    );
+    info!(
+        "║    Positions Entered:  {:>6}                              ",
+        metrics.positions_entered
+    );
+    info!(
+        "║    Rebalances:         {:>6}                              ",
+        metrics.rebalances_triggered
+    );
+    info!(
+        "║    Funding Collections:{:>6}                              ",
+        metrics.funding_collections
+    );
+    info!(
+        "║    Orders Placed:      {:>6}                              ",
+        state.order_count
+    );
+    info!(
+        "║    Errors:             {:>6}                              ",
+        metrics.errors_count
+    );
     info!("╠════════════════════════════════════════════════════════════╣");
     info!("║ ⚠️  RISK                                                   ║");
-    info!("║    Current Drawdown:   {:>6.2}%                            ", drawdown_tracker.current_drawdown() * dec!(100));
-    info!("║    Session MDD:        {:>6.2}%                            ", drawdown_tracker.session_mdd() * dec!(100));
-    info!("║    Peak Equity:        ${:>12.2}                     ", drawdown_tracker.peak_equity());
-    info!("║    Active Positions:   {:>6}                              ", state.positions.len());
+    info!(
+        "║    Current Drawdown:   {:>6.2}%                            ",
+        drawdown_tracker.current_drawdown() * dec!(100)
+    );
+    info!(
+        "║    Session MDD:        {:>6.2}%                            ",
+        drawdown_tracker.session_mdd() * dec!(100)
+    );
+    info!(
+        "║    Peak Equity:        ${:>12.2}                     ",
+        drawdown_tracker.peak_equity()
+    );
+    info!(
+        "║    Active Positions:   {:>6}                              ",
+        state.positions.len()
+    );
     info!("╚════════════════════════════════════════════════════════════╝");
 }

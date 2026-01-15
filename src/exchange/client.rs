@@ -33,7 +33,10 @@ impl BinanceClient {
             .context("Failed to create HTTP client")?;
 
         let (futures_base_url, spot_base_url) = if config.testnet {
-            (FUTURES_TESTNET_URL.to_string(), SPOT_TESTNET_URL.to_string())
+            (
+                FUTURES_TESTNET_URL.to_string(),
+                SPOT_TESTNET_URL.to_string(),
+            )
         } else {
             (FUTURES_BASE_URL.to_string(), SPOT_BASE_URL.to_string())
         };
@@ -136,6 +139,23 @@ impl BinanceClient {
             .context("Failed to parse open interest response")
     }
 
+    /// Get futures exchange info (for precision and rules).
+    #[instrument(skip(self))]
+    pub async fn get_futures_exchange_info(&self) -> Result<FuturesExchangeInfo> {
+        let url = format!("{}/fapi/v1/exchangeInfo", self.futures_base_url);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch futures exchange info")?;
+
+        response
+            .json()
+            .await
+            .context("Failed to parse futures exchange info")
+    }
+
     // ==================== Account (Authenticated) ====================
 
     /// Get account balance information.
@@ -198,8 +218,14 @@ impl BinanceClient {
         let timestamp = Self::timestamp();
         let mut params = vec![
             ("symbol".to_string(), order.symbol.clone()),
-            ("side".to_string(), format!("{:?}", order.side).to_uppercase()),
-            ("type".to_string(), format!("{:?}", order.order_type).to_uppercase()),
+            (
+                "side".to_string(),
+                format!("{:?}", order.side).to_uppercase(),
+            ),
+            (
+                "type".to_string(),
+                format!("{:?}", order.order_type).to_uppercase(),
+            ),
             ("timestamp".to_string(), timestamp.to_string()),
         ];
 
@@ -212,7 +238,10 @@ impl BinanceClient {
         }
 
         if let Some(tif) = &order.time_in_force {
-            params.push(("timeInForce".to_string(), format!("{:?}", tif).to_uppercase()));
+            params.push((
+                "timeInForce".to_string(),
+                format!("{:?}", tif).to_uppercase(),
+            ));
         }
 
         if let Some(reduce_only) = order.reduce_only {
@@ -410,10 +439,7 @@ impl BinanceClient {
     #[instrument(skip(self))]
     pub async fn margin_borrow(&self, asset: &str, amount: rust_decimal::Decimal) -> Result<()> {
         let timestamp = Self::timestamp();
-        let query = format!(
-            "asset={}&amount={}&timestamp={}",
-            asset, amount, timestamp
-        );
+        let query = format!("asset={}&amount={}&timestamp={}", asset, amount, timestamp);
         let signature = self.sign(&query);
 
         let url = format!(
@@ -441,10 +467,7 @@ impl BinanceClient {
     #[instrument(skip(self))]
     pub async fn margin_repay(&self, asset: &str, amount: rust_decimal::Decimal) -> Result<()> {
         let timestamp = Self::timestamp();
-        let query = format!(
-            "asset={}&amount={}&timestamp={}",
-            asset, amount, timestamp
-        );
+        let query = format!("asset={}&amount={}&timestamp={}", asset, amount, timestamp);
         let signature = self.sign(&query);
 
         let url = format!(
@@ -474,8 +497,14 @@ impl BinanceClient {
         let timestamp = Self::timestamp();
         let mut params = vec![
             ("symbol".to_string(), order.symbol.clone()),
-            ("side".to_string(), format!("{:?}", order.side).to_uppercase()),
-            ("type".to_string(), format!("{:?}", order.order_type).to_uppercase()),
+            (
+                "side".to_string(),
+                format!("{:?}", order.side).to_uppercase(),
+            ),
+            (
+                "type".to_string(),
+                format!("{:?}", order.order_type).to_uppercase(),
+            ),
             ("timestamp".to_string(), timestamp.to_string()),
         ];
 
@@ -488,11 +517,17 @@ impl BinanceClient {
         }
 
         if let Some(tif) = &order.time_in_force {
-            params.push(("timeInForce".to_string(), format!("{:?}", tif).to_uppercase()));
+            params.push((
+                "timeInForce".to_string(),
+                format!("{:?}", tif).to_uppercase(),
+            ));
         }
 
         if let Some(side_effect) = &order.side_effect_type {
-            params.push(("sideEffectType".to_string(), format!("{:?}", side_effect).to_uppercase()));
+            params.push((
+                "sideEffectType".to_string(),
+                format!("{:?}", side_effect).to_uppercase(),
+            ));
         }
 
         let query_string: String = params

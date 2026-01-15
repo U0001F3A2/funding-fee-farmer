@@ -1,0 +1,17 @@
+[Unit]
+Description=Funding Fee Farmer Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/funding-fee-farmer
+ExecStart=/home/ec2-user/funding-fee-farmer/funding-fee-farmer
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/ec2-user/funding-fee-farmer/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

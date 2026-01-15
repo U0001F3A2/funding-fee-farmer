@@ -17,6 +17,26 @@ pub struct SymbolInfo {
     pub quantity_precision: u8,
 }
 
+/// Exchange information for futures.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FuturesExchangeInfo {
+    pub symbols: Vec<FuturesSymbolInfo>,
+}
+
+/// Symbol information for futures.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FuturesSymbolInfo {
+    pub symbol: String,
+    pub quantity_precision: u8,
+    pub price_precision: u8,
+    pub contract_type: String,
+    pub status: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+}
+
 /// Funding rate information for a perpetual contract.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

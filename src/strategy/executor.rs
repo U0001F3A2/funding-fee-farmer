@@ -12,9 +12,12 @@ use rust_decimal_macros::dec;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use std::collections::HashMap;
+
 /// Handles order execution for funding fee farming positions.
 pub struct OrderExecutor {
     config: ExecutionConfig,
+    precisions: HashMap<String, u8>,
 }
 
 /// Result of a position entry attempt.
@@ -30,7 +33,15 @@ pub struct EntryResult {
 impl OrderExecutor {
     /// Create a new order executor.
     pub fn new(config: ExecutionConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            precisions: HashMap::new(),
+        }
+    }
+
+    /// Update symbol precisions.
+    pub fn set_precisions(&mut self, precisions: HashMap<String, u8>) {
+        self.precisions = precisions;
     }
 
     /// Execute a delta-neutral entry (spot + futures hedge).
@@ -113,10 +124,19 @@ impl OrderExecutor {
         };
 
         // Now execute spot hedge
-        let actual_futures_qty = futures_order.as_ref().map(|o| o.executed_qty).unwrap_or(quantity);
+        let actual_futures_qty = futures_order
+            .as_ref()
+            .map(|o| o.executed_qty)
+            .unwrap_or(quantity);
 
         let spot_result = self
-            .place_spot_margin_order(client, spot_symbol, spot_side, actual_futures_qty, is_positive_funding)
+            .place_spot_margin_order(
+                client,
+                spot_symbol,
+                spot_side,
+                actual_futures_qty,
+                is_positive_funding,
+            )
             .await;
 
         let spot_order = match spot_result {
@@ -145,7 +165,13 @@ impl OrderExecutor {
                         OrderSide::Buy
                     };
                     if let Err(unwind_err) = self
-                        .place_futures_order_with_retry(client, symbol, unwind_side, f_order.executed_qty, 3)
+                        .place_futures_order_with_retry(
+                            client,
+                            symbol,
+                            unwind_side,
+                            f_order.executed_qty,
+                            3,
+                        )
                         .await
                     {
                         error!(%symbol, error = %unwind_err, "CRITICAL: Failed to unwind futures position!");
@@ -162,8 +188,14 @@ impl OrderExecutor {
         };
 
         // Verify delta neutrality
-        let futures_qty = futures_order.as_ref().map(|o| o.executed_qty).unwrap_or(dec!(0));
-        let spot_qty = spot_order.as_ref().map(|o| o.executed_qty).unwrap_or(dec!(0));
+        let futures_qty = futures_order
+            .as_ref()
+            .map(|o| o.executed_qty)
+            .unwrap_or(dec!(0));
+        let spot_qty = spot_order
+            .as_ref()
+            .map(|o| o.executed_qty)
+            .unwrap_or(dec!(0));
         let delta_diff = (futures_qty - spot_qty).abs();
         let delta_pct = if futures_qty > dec!(0) {
             delta_diff / futures_qty * dec!(100)
@@ -235,8 +267,16 @@ impl OrderExecutor {
         quantity: Decimal,
         max_retries: u8,
     ) -> Result<OrderResponse> {
-        self.place_order_with_retry(client, symbol, side, OrderType::Market, quantity, None, max_retries)
-            .await
+        self.place_order_with_retry(
+            client,
+            symbol,
+            side,
+            OrderType::Market,
+            quantity,
+            None,
+            max_retries,
+        )
+        .await
     }
 
     /// Exit an existing position.
@@ -261,16 +301,8 @@ impl OrderExecutor {
             "Exiting position"
         );
 
-        self.place_order_with_retry(
-            client,
-            symbol,
-            side,
-            OrderType::Market,
-            quantity,
-            None,
-            3,
-        )
-        .await
+        self.place_order_with_retry(client, symbol, side, OrderType::Market, quantity, None, 3)
+            .await
     }
 
     /// Prepare futures symbol (set leverage and margin type).
@@ -281,10 +313,7 @@ impl OrderExecutor {
         leverage: u8,
     ) -> Result<()> {
         // Set cross margin (more capital efficient)
-        client
-            .set_margin_type(symbol, MarginType::Cross)
-            .await
-            .ok(); // Ignore error if already set
+        client.set_margin_type(symbol, MarginType::Cross).await.ok(); // Ignore error if already set
 
         // Set leverage
         client.set_leverage(symbol, leverage).await?;
@@ -345,18 +374,13 @@ impl OrderExecutor {
     }
 
     /// Round quantity to valid precision for the symbol.
-    fn round_quantity(&self, quantity: Decimal, _symbol: &str) -> Decimal {
-        // TODO: Get precision from exchange info
-        // For now, use reasonable defaults
-        quantity.round_dp(3)
+    fn round_quantity(&self, quantity: Decimal, symbol: &str) -> Decimal {
+        let precision = self.precisions.get(symbol).copied().unwrap_or(3);
+        quantity.round_dp(precision as u32)
     }
 
     /// Check if position entry should proceed based on slippage.
-    pub fn check_slippage(
-        &self,
-        expected_price: Decimal,
-        actual_price: Decimal,
-    ) -> bool {
+    pub fn check_slippage(&self, expected_price: Decimal, actual_price: Decimal) -> bool {
         let slippage = ((actual_price - expected_price) / expected_price).abs();
         slippage <= self.config.slippage_tolerance
     }
