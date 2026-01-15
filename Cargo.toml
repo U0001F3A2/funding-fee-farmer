@@ -1,0 +1,65 @@
+[package]
+name = "funding-fee-farmer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High-performance delta-neutral funding fee farming on Binance"
+license = "MIT"
+repository = "https://github.com/yourusername/funding-fee-farmer"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Precise decimal arithmetic (critical for financial calculations)
+rust_decimal = { version = "1.37", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1.37"
+
+# Configuration
+config = "0.14"
+dotenvy = "0.15"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cryptographic signing for API requests
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# URL encoding
+urlencoding = "2.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.13"
+wiremock = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
