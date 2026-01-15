@@ -6,9 +6,11 @@
 //! - User data streams (order updates, position changes)
 
 mod client;
+pub mod mock;
 mod types;
 mod websocket;
 
 pub use client::BinanceClient;
+pub use mock::MockBinanceClient;
 pub use types::*;
 pub use websocket::BinanceWebSocket;

@@ -2,12 +2,13 @@
 
 use crate::config::ExecutionConfig;
 use crate::exchange::{
-    BinanceClient, MarginType, NewOrder, OrderResponse, OrderSide, OrderStatus,
-    OrderType, TimeInForce,
+    BinanceClient, MarginOrder, MarginType, NewOrder, OrderResponse, OrderSide, OrderStatus,
+    OrderType, SideEffectType, TimeInForce,
 };
 use crate::strategy::allocator::PositionAllocation;
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -34,8 +35,8 @@ impl OrderExecutor {
 
     /// Execute a delta-neutral entry (spot + futures hedge).
     ///
-    /// For positive funding: Long spot + Short futures
-    /// For negative funding: Short spot (margin) + Long futures
+    /// For positive funding: Long spot + Short futures (we receive funding)
+    /// For negative funding: Short spot (margin borrow) + Long futures (we receive funding)
     pub async fn enter_position(
         &self,
         client: &BinanceClient,
@@ -43,14 +44,16 @@ impl OrderExecutor {
         current_price: Decimal,
     ) -> Result<EntryResult> {
         let symbol = &allocation.symbol;
+        let spot_symbol = &allocation.spot_symbol;
         let is_positive_funding = allocation.funding_rate > Decimal::ZERO;
 
         info!(
             %symbol,
+            %spot_symbol,
             target_size = %allocation.target_size_usdt,
             funding_rate = %allocation.funding_rate,
             positive = is_positive_funding,
-            "Entering position"
+            "Entering delta-neutral position"
         );
 
         // Set up futures account for this symbol
@@ -62,26 +65,20 @@ impl OrderExecutor {
         let quantity = self.round_quantity(quantity, symbol);
 
         // Determine order sides based on funding direction
-        let (_spot_side, futures_side) = if is_positive_funding {
-            (OrderSide::Buy, OrderSide::Sell) // Long spot, short futures
+        let (spot_side, futures_side) = if is_positive_funding {
+            // Positive funding: Short futures earns funding, long spot as hedge
+            (OrderSide::Buy, OrderSide::Sell)
         } else {
-            (OrderSide::Sell, OrderSide::Buy) // Short spot (margin), long futures
+            // Negative funding: Long futures earns funding, short spot as hedge (needs borrow)
+            (OrderSide::Sell, OrderSide::Buy)
         };
 
         // Execute futures order first (more critical for funding capture)
-        let futures_order = self
-            .place_order_with_retry(
-                client,
-                symbol,
-                futures_side,
-                OrderType::Market,
-                quantity,
-                None,
-                3,
-            )
+        let futures_result = self
+            .place_futures_order_with_retry(client, symbol, futures_side, quantity, 3)
             .await;
 
-        match futures_order {
+        let futures_order = match futures_result {
             Ok(order) if order.status == OrderStatus::Filled => {
                 info!(
                     %symbol,
@@ -90,45 +87,156 @@ impl OrderExecutor {
                     avg_price = %order.avg_price,
                     "Futures order filled"
                 );
-
-                // TODO: Execute spot hedge
-                // For now, we only implement futures side
-                // Spot hedging requires margin account setup
-
-                Ok(EntryResult {
-                    symbol: symbol.clone(),
-                    spot_order: None, // TODO: Implement spot leg
-                    futures_order: Some(order),
-                    success: true,
-                    error: None,
-                })
+                Some(order)
             }
             Ok(order) => {
                 let status = order.status;
-                warn!(
-                    %symbol,
-                    status = ?status,
-                    "Futures order not fully filled"
-                );
-                Ok(EntryResult {
+                warn!(%symbol, status = ?status, "Futures order not fully filled");
+                return Ok(EntryResult {
                     symbol: symbol.clone(),
                     spot_order: None,
                     futures_order: Some(order),
                     success: false,
-                    error: Some(format!("Order status: {:?}", status)),
-                })
+                    error: Some(format!("Futures order status: {:?}", status)),
+                });
             }
             Err(e) => {
                 error!(%symbol, error = %e, "Failed to place futures order");
-                Ok(EntryResult {
+                return Ok(EntryResult {
                     symbol: symbol.clone(),
                     spot_order: None,
                     futures_order: None,
                     success: false,
                     error: Some(e.to_string()),
-                })
+                });
             }
+        };
+
+        // Now execute spot hedge
+        let actual_futures_qty = futures_order.as_ref().map(|o| o.executed_qty).unwrap_or(quantity);
+
+        let spot_result = self
+            .place_spot_margin_order(client, spot_symbol, spot_side, actual_futures_qty, is_positive_funding)
+            .await;
+
+        let spot_order = match spot_result {
+            Ok(order) if order.status == OrderStatus::Filled => {
+                info!(
+                    %spot_symbol,
+                    order_id = order.order_id,
+                    filled_qty = %order.executed_qty,
+                    avg_price = %order.avg_price,
+                    "Spot margin order filled - delta neutral achieved"
+                );
+                Some(order)
+            }
+            Ok(order) => {
+                let status = order.status;
+                warn!(%spot_symbol, status = ?status, "Spot order not fully filled - position may be unhedged!");
+                Some(order)
+            }
+            Err(e) => {
+                error!(%spot_symbol, error = %e, "Failed to place spot hedge order - UNWINDING FUTURES");
+                // Critical: Spot leg failed, need to unwind futures to avoid naked exposure
+                if let Some(ref f_order) = futures_order {
+                    let unwind_side = if futures_side == OrderSide::Buy {
+                        OrderSide::Sell
+                    } else {
+                        OrderSide::Buy
+                    };
+                    if let Err(unwind_err) = self
+                        .place_futures_order_with_retry(client, symbol, unwind_side, f_order.executed_qty, 3)
+                        .await
+                    {
+                        error!(%symbol, error = %unwind_err, "CRITICAL: Failed to unwind futures position!");
+                    }
+                }
+                return Ok(EntryResult {
+                    symbol: symbol.clone(),
+                    spot_order: None,
+                    futures_order,
+                    success: false,
+                    error: Some(format!("Spot hedge failed: {}", e)),
+                });
+            }
+        };
+
+        // Verify delta neutrality
+        let futures_qty = futures_order.as_ref().map(|o| o.executed_qty).unwrap_or(dec!(0));
+        let spot_qty = spot_order.as_ref().map(|o| o.executed_qty).unwrap_or(dec!(0));
+        let delta_diff = (futures_qty - spot_qty).abs();
+        let delta_pct = if futures_qty > dec!(0) {
+            delta_diff / futures_qty * dec!(100)
+        } else {
+            dec!(0)
+        };
+
+        if delta_pct > dec!(1) {
+            warn!(
+                %symbol,
+                futures_qty = %futures_qty,
+                spot_qty = %spot_qty,
+                delta_diff_pct = %delta_pct,
+                "Delta mismatch > 1% - position partially hedged"
+            );
         }
+
+        Ok(EntryResult {
+            symbol: symbol.clone(),
+            spot_order,
+            futures_order,
+            success: delta_pct <= dec!(5), // Allow up to 5% mismatch
+            error: if delta_pct > dec!(5) {
+                Some(format!("Delta mismatch: {:.2}%", delta_pct))
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Place a spot margin order for hedging.
+    async fn place_spot_margin_order(
+        &self,
+        client: &BinanceClient,
+        symbol: &str,
+        side: OrderSide,
+        quantity: Decimal,
+        is_positive_funding: bool,
+    ) -> Result<OrderResponse> {
+        // For positive funding (buying spot): NO_SIDE_EFFECT (normal buy)
+        // For negative funding (selling spot): MARGIN_BUY to auto-borrow the asset
+        let side_effect = if is_positive_funding {
+            SideEffectType::NoSideEffect
+        } else {
+            // Shorting spot requires borrowing the base asset first
+            SideEffectType::MarginBuy
+        };
+
+        let order = MarginOrder {
+            symbol: symbol.to_string(),
+            side,
+            order_type: OrderType::Market,
+            quantity: Some(quantity),
+            price: None,
+            time_in_force: None,
+            is_isolated: Some(false), // Cross margin for capital efficiency
+            side_effect_type: Some(side_effect),
+        };
+
+        client.place_margin_order(&order).await
+    }
+
+    /// Place a futures order with retry logic.
+    async fn place_futures_order_with_retry(
+        &self,
+        client: &BinanceClient,
+        symbol: &str,
+        side: OrderSide,
+        quantity: Decimal,
+        max_retries: u8,
+    ) -> Result<OrderResponse> {
+        self.place_order_with_retry(client, symbol, side, OrderType::Market, quantity, None, max_retries)
+            .await
     }
 
     /// Exit an existing position.

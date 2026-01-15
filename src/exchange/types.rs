@@ -217,9 +217,138 @@ pub struct OpenInterest {
 #[derive(Debug, Clone)]
 pub struct QualifiedPair {
     pub symbol: String,
+    /// Spot symbol (e.g., "BTCUSDT" for futures "BTCUSDT")
+    pub spot_symbol: String,
+    /// Base asset (e.g., "BTC")
+    pub base_asset: String,
     pub funding_rate: Decimal,
     pub volume_24h: Decimal,
     pub spread: Decimal,
     pub open_interest: Decimal,
+    /// Whether spot margin trading is available for hedging
+    pub margin_available: bool,
+    /// Hourly borrow rate for the base asset (for shorting)
+    pub borrow_rate: Option<Decimal>,
     pub score: Decimal,
+}
+
+// ==================== Spot Margin Types ====================
+
+/// Spot symbol information from exchange info.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotSymbolInfo {
+    pub symbol: String,
+    pub base_asset: String,
+    pub quote_asset: String,
+    pub status: String,
+    /// Whether margin trading is permitted
+    #[serde(default)]
+    pub is_margin_trading_allowed: bool,
+}
+
+/// Margin asset information.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginAsset {
+    pub asset: String,
+    /// Whether the asset can be borrowed
+    pub borrowable: bool,
+    /// Whether the asset can be used as collateral
+    pub collateral: bool,
+    /// Margin interest rate (daily)
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub margin_interest_rate: Option<Decimal>,
+}
+
+/// Cross margin account details.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossMarginAccount {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_asset_of_btc: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_liability_of_btc: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_net_asset_of_btc: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub margin_level: Decimal,
+    pub user_assets: Vec<MarginAccountAsset>,
+}
+
+/// Asset balance in margin account.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginAccountAsset {
+    pub asset: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub free: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub locked: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub borrowed: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub interest: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub net_asset: Decimal,
+}
+
+/// Margin borrow/repay request.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarginLoanRequest {
+    pub asset: String,
+    pub amount: Decimal,
+}
+
+/// Margin order request (for spot margin trading).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginOrder {
+    pub symbol: String,
+    pub side: OrderSide,
+    #[serde(rename = "type")]
+    pub order_type: OrderType,
+    pub quantity: Option<Decimal>,
+    pub price: Option<Decimal>,
+    pub time_in_force: Option<TimeInForce>,
+    /// For isolated margin, specify the symbol
+    pub is_isolated: Option<bool>,
+    /// MARGIN_BUY, AUTO_REPAY, etc.
+    pub side_effect_type: Option<SideEffectType>,
+}
+
+/// Side effect type for margin orders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SideEffectType {
+    /// Normal trade
+    NoSideEffect,
+    /// Borrow to execute the trade
+    MarginBuy,
+    /// Repay debt with trade proceeds
+    AutoRepay,
+    /// Auto-borrow and auto-repay
+    AutoBorrowRepay,
+}
+
+/// Represents a delta-neutral position (futures + spot hedge).
+#[derive(Debug, Clone)]
+pub struct DeltaNeutralPosition {
+    pub symbol: String,
+    pub spot_symbol: String,
+    pub base_asset: String,
+    /// Futures position amount (negative = short)
+    pub futures_qty: Decimal,
+    pub futures_entry_price: Decimal,
+    /// Spot position amount (negative = short via margin)
+    pub spot_qty: Decimal,
+    pub spot_entry_price: Decimal,
+    /// Net delta (should be ~0 for delta-neutral)
+    pub net_delta: Decimal,
+    /// Borrowed amount if shorting spot
+    pub borrowed_amount: Decimal,
+    /// Accumulated funding received/paid
+    pub funding_pnl: Decimal,
+    /// Accumulated borrow interest paid
+    pub interest_paid: Decimal,
 }

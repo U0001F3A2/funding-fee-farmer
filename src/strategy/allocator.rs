@@ -10,10 +10,19 @@ use tracing::debug;
 /// Target allocation for a single position.
 #[derive(Debug, Clone)]
 pub struct PositionAllocation {
+    /// Futures symbol (e.g., "BTCUSDT")
     pub symbol: String,
+    /// Corresponding spot symbol for hedging
+    pub spot_symbol: String,
+    /// Base asset (e.g., "BTC")
+    pub base_asset: String,
+    /// Target position size in USDT
     pub target_size_usdt: Decimal,
+    /// Leverage to use for futures
     pub leverage: u8,
+    /// Current funding rate (positive = we receive when short)
     pub funding_rate: Decimal,
+    /// Priority rank (1 = highest)
     pub priority: u8,
 }
 
@@ -107,6 +116,8 @@ impl CapitalAllocator {
 
             allocations.push(PositionAllocation {
                 symbol: pair.symbol.clone(),
+                spot_symbol: pair.spot_symbol.clone(),
+                base_asset: pair.base_asset.clone(),
                 target_size_usdt: target_size,
                 leverage: self.default_leverage,
                 funding_rate: pair.funding_rate,
@@ -170,26 +181,28 @@ mod tests {
         )
     }
 
+    fn test_pair(symbol: &str, funding_rate: Decimal, score: Decimal) -> QualifiedPair {
+        let base_asset = symbol.strip_suffix("USDT").unwrap_or(symbol).to_string();
+        QualifiedPair {
+            symbol: symbol.to_string(),
+            spot_symbol: symbol.to_string(),
+            base_asset,
+            funding_rate,
+            volume_24h: dec!(1_000_000_000),
+            spread: dec!(0.0001),
+            open_interest: dec!(500_000_000),
+            margin_available: true,
+            borrow_rate: Some(dec!(0.0001)),
+            score,
+        }
+    }
+
     #[test]
     fn test_allocation_respects_max_utilization() {
         let allocator = test_allocator();
         let pairs = vec![
-            QualifiedPair {
-                symbol: "BTCUSDT".to_string(),
-                funding_rate: dec!(0.001),
-                volume_24h: dec!(1_000_000_000),
-                spread: dec!(0.0001),
-                open_interest: dec!(500_000_000),
-                score: dec!(15),
-            },
-            QualifiedPair {
-                symbol: "ETHUSDT".to_string(),
-                funding_rate: dec!(0.0008),
-                volume_24h: dec!(800_000_000),
-                spread: dec!(0.00015),
-                open_interest: dec!(300_000_000),
-                score: dec!(12),
-            },
+            test_pair("BTCUSDT", dec!(0.001), dec!(15)),
+            test_pair("ETHUSDT", dec!(0.0008), dec!(12)),
         ];
 
         let allocations = allocator.calculate_allocation(
@@ -209,14 +222,7 @@ mod tests {
     #[test]
     fn test_allocation_respects_max_single_position() {
         let allocator = test_allocator();
-        let pairs = vec![QualifiedPair {
-            symbol: "BTCUSDT".to_string(),
-            funding_rate: dec!(0.01), // Very high funding
-            volume_24h: dec!(10_000_000_000),
-            spread: dec!(0.00005),
-            open_interest: dec!(5_000_000_000),
-            score: dec!(100), // Very high score
-        }];
+        let pairs = vec![test_pair("BTCUSDT", dec!(0.01), dec!(100))];
 
         let allocations = allocator.calculate_allocation(
             &pairs,

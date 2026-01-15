@@ -5,6 +5,7 @@ use crate::exchange::types::*;
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
+use serde::Deserialize;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, instrument};
@@ -333,5 +334,221 @@ impl BinanceClient {
             .await;
 
         Ok(())
+    }
+
+    // ==================== Spot Margin (Authenticated) ====================
+
+    /// Get spot exchange info to check which pairs support margin trading.
+    #[instrument(skip(self))]
+    pub async fn get_spot_exchange_info(&self) -> Result<Vec<SpotSymbolInfo>> {
+        let url = format!("{}/api/v3/exchangeInfo", self.spot_base_url);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch spot exchange info")?;
+
+        #[derive(Deserialize)]
+        struct ExchangeInfo {
+            symbols: Vec<SpotSymbolInfo>,
+        }
+
+        let info: ExchangeInfo = response
+            .json()
+            .await
+            .context("Failed to parse spot exchange info")?;
+
+        Ok(info.symbols)
+    }
+
+    /// Get all margin assets and their borrowability.
+    #[instrument(skip(self))]
+    pub async fn get_margin_all_assets(&self) -> Result<Vec<MarginAsset>> {
+        let url = format!("{}/sapi/v1/margin/allAssets", self.spot_base_url);
+        let response = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to fetch margin assets")?;
+
+        response
+            .json()
+            .await
+            .context("Failed to parse margin assets response")
+    }
+
+    /// Get cross margin account details.
+    #[instrument(skip(self))]
+    pub async fn get_cross_margin_account(&self) -> Result<CrossMarginAccount> {
+        let timestamp = Self::timestamp();
+        let query = format!("timestamp={}", timestamp);
+        let signature = self.sign(&query);
+
+        let url = format!(
+            "{}/sapi/v1/margin/account?{}&signature={}",
+            self.spot_base_url, query, signature
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to fetch cross margin account")?;
+
+        response
+            .json()
+            .await
+            .context("Failed to parse cross margin account response")
+    }
+
+    /// Borrow an asset in cross margin.
+    #[instrument(skip(self))]
+    pub async fn margin_borrow(&self, asset: &str, amount: rust_decimal::Decimal) -> Result<()> {
+        let timestamp = Self::timestamp();
+        let query = format!(
+            "asset={}&amount={}&timestamp={}",
+            asset, amount, timestamp
+        );
+        let signature = self.sign(&query);
+
+        let url = format!(
+            "{}/sapi/v1/margin/loan?{}&signature={}",
+            self.spot_base_url, query, signature
+        );
+
+        let response = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to borrow asset")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Margin borrow failed: {}", error_text);
+        }
+
+        Ok(())
+    }
+
+    /// Repay borrowed asset in cross margin.
+    #[instrument(skip(self))]
+    pub async fn margin_repay(&self, asset: &str, amount: rust_decimal::Decimal) -> Result<()> {
+        let timestamp = Self::timestamp();
+        let query = format!(
+            "asset={}&amount={}&timestamp={}",
+            asset, amount, timestamp
+        );
+        let signature = self.sign(&query);
+
+        let url = format!(
+            "{}/sapi/v1/margin/repay?{}&signature={}",
+            self.spot_base_url, query, signature
+        );
+
+        let response = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to repay asset")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Margin repay failed: {}", error_text);
+        }
+
+        Ok(())
+    }
+
+    /// Place a cross margin order.
+    #[instrument(skip(self))]
+    pub async fn place_margin_order(&self, order: &MarginOrder) -> Result<OrderResponse> {
+        let timestamp = Self::timestamp();
+        let mut params = vec![
+            ("symbol".to_string(), order.symbol.clone()),
+            ("side".to_string(), format!("{:?}", order.side).to_uppercase()),
+            ("type".to_string(), format!("{:?}", order.order_type).to_uppercase()),
+            ("timestamp".to_string(), timestamp.to_string()),
+        ];
+
+        if let Some(qty) = &order.quantity {
+            params.push(("quantity".to_string(), qty.to_string()));
+        }
+
+        if let Some(price) = &order.price {
+            params.push(("price".to_string(), price.to_string()));
+        }
+
+        if let Some(tif) = &order.time_in_force {
+            params.push(("timeInForce".to_string(), format!("{:?}", tif).to_uppercase()));
+        }
+
+        if let Some(side_effect) = &order.side_effect_type {
+            params.push(("sideEffectType".to_string(), format!("{:?}", side_effect).to_uppercase()));
+        }
+
+        let query_string: String = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let signature = self.sign(&query_string);
+        let url = format!(
+            "{}/sapi/v1/margin/order?{}&signature={}",
+            self.spot_base_url, query_string, signature
+        );
+
+        debug!("Placing margin order: {:?}", order);
+
+        let response = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to place margin order")?;
+
+        response
+            .json()
+            .await
+            .context("Failed to parse margin order response")
+    }
+
+    /// Get spot price for a symbol.
+    #[instrument(skip(self))]
+    pub async fn get_spot_price(&self, symbol: &str) -> Result<rust_decimal::Decimal> {
+        let url = format!(
+            "{}/api/v3/ticker/price?symbol={}",
+            self.spot_base_url, symbol
+        );
+
+        #[derive(Deserialize)]
+        struct PriceTicker {
+            #[serde(with = "rust_decimal::serde::str")]
+            price: rust_decimal::Decimal,
+        }
+
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch spot price")?;
+
+        let ticker: PriceTicker = response
+            .json()
+            .await
+            .context("Failed to parse spot price response")?;
+
+        Ok(ticker.price)
     }
 }

@@ -208,10 +208,12 @@ mod tests {
         let mut tracker = DrawdownTracker::new(dec!(0.05), dec!(10000));
 
         // At 4% drawdown, should warn (20% buffer = 1% remaining)
+        // Warning threshold = 5% * 0.2 = 1%
+        // Distance to max = 5% - 4% = 1%
         tracker.update(dec!(9600)); // 4% DD
 
         let (is_warning, distance) = tracker.warning_check();
         assert!(is_warning);
-        assert!(distance < dec!(0.01));
+        assert!(distance <= dec!(0.01)); // Exactly at warning threshold
     }
 }
