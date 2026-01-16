@@ -32,3 +32,4 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+env.tar.gz

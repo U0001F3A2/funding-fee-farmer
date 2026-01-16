@@ -17,6 +17,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -78,34 +79,32 @@ jobs:
           fi
 
       - name: Prepare implementation prompt
+        id: prepare-prompt
         run: |
           # Read from files (safe - content never executed as shell)
-          cat > /tmp/implement_prompt.txt << 'PROMPT_HEADER'
+          ISSUE_TITLE=$(cat /tmp/issue_title.txt)
+          ISSUE_BODY=$(cat /tmp/issue_body.txt)
+          COMMENT_BODY=""
+          if [ -f /tmp/comment_body.txt ]; then
+            COMMENT_BODY=$(cat /tmp/comment_body.txt)
+          fi
+
+          # Build prompt content
+          cat > /tmp/implement_prompt.txt << PROMPT_EOF
           You are implementing an improvement for a Rust-based funding fee farming bot.
 
           ## Issue Title
-          PROMPT_HEADER
-
-          # Append title from file (not shell variable)
-          cat /tmp/issue_title.txt >> /tmp/implement_prompt.txt
-          echo "" >> /tmp/implement_prompt.txt
-
-          cat >> /tmp/implement_prompt.txt << 'PROMPT_BODY_HEADER'
+          ${ISSUE_TITLE}
 
           ## Issue Description
-          PROMPT_BODY_HEADER
-
-          # Append body from file
-          cat /tmp/issue_body.txt >> /tmp/implement_prompt.txt
-
-          cat >> /tmp/implement_prompt.txt << 'PROMPT_INSTRUCTIONS'
+          ${ISSUE_BODY}
 
           ## Instructions
           1. Read the relevant source files mentioned in the issue
           2. Understand the current implementation
           3. Implement the suggested improvement
-          4. Ensure the code compiles with `cargo build`
-          5. Run tests with `cargo test` to verify nothing is broken
+          4. Ensure the code compiles with \`cargo build\`
+          5. Run tests with \`cargo test\` to verify nothing is broken
           6. Keep changes minimal and focused on the issue
 
           ## Guidelines
@@ -116,21 +115,26 @@ jobs:
           - Do NOT modify unrelated code
 
           Please implement this improvement now.
-          PROMPT_INSTRUCTIONS
+          PROMPT_EOF
 
           # Add comment context if triggered by comment
-          if [ -f /tmp/comment_body.txt ]; then
+          if [ -n "$COMMENT_BODY" ]; then
             echo "" >> /tmp/implement_prompt.txt
             echo "## Additional Context from Comment" >> /tmp/implement_prompt.txt
-            cat /tmp/comment_body.txt >> /tmp/implement_prompt.txt
+            echo "$COMMENT_BODY" >> /tmp/implement_prompt.txt
           fi
+
+          # Store prompt in output using delimiter for multiline
+          echo "prompt<<PROMPT_DELIMITER" >> "$GITHUB_OUTPUT"
+          cat /tmp/implement_prompt.txt >> "$GITHUB_OUTPUT"
+          echo "PROMPT_DELIMITER" >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt_file: /tmp/implement_prompt.txt
+          direct_prompt: ${{ steps.prepare-prompt.outputs.prompt }}
           allowed_tools: "Bash,Read,Write,Edit,Glob,Grep"
           max_turns: 30
 

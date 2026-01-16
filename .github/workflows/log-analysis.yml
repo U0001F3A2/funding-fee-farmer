@@ -17,6 +17,7 @@ jobs:
     permissions:
       issues: write
       contents: read
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -67,29 +68,23 @@ jobs:
       - name: Prepare analysis prompt
         id: prepare-prompt
         run: |
-          # Read logs and escape for JSON
+          # Read logs
           SERVICE_STATUS=$(cat /tmp/service_status.txt | head -50)
           RECENT_LOGS=$(cat /tmp/recent_logs.txt | tail -400)
 
-          # Create the prompt file
-          cat > /tmp/analysis_prompt.txt << 'PROMPT_EOF'
+          # Build prompt content and save to file for the action
+          cat > /tmp/analysis_prompt.txt << PROMPT_EOF
           Analyze these funding fee farmer bot logs and identify potential improvements.
 
           ## Service Status
-          PROMPT_EOF
-          echo '```' >> /tmp/analysis_prompt.txt
-          echo "$SERVICE_STATUS" >> /tmp/analysis_prompt.txt
-          echo '```' >> /tmp/analysis_prompt.txt
-
-          cat >> /tmp/analysis_prompt.txt << 'PROMPT_EOF'
+          \`\`\`
+          ${SERVICE_STATUS}
+          \`\`\`
 
           ## Recent Logs
-          PROMPT_EOF
-          echo '```' >> /tmp/analysis_prompt.txt
-          echo "$RECENT_LOGS" >> /tmp/analysis_prompt.txt
-          echo '```' >> /tmp/analysis_prompt.txt
-
-          cat >> /tmp/analysis_prompt.txt << 'PROMPT_EOF'
+          \`\`\`
+          ${RECENT_LOGS}
+          \`\`\`
 
           Please analyze and provide:
           1. **Health Assessment**: Is the bot running correctly? Any critical issues?
@@ -103,7 +98,7 @@ jobs:
           - Impact: Brief description of the benefit
 
           Format your response as JSON with this structure:
-          ```json
+          \`\`\`json
           {
             "health_status": "healthy|degraded|critical",
             "summary": "Brief overall summary",
@@ -120,15 +115,20 @@ jobs:
               }
             ]
           }
-          ```
+          \`\`\`
           PROMPT_EOF
+
+          # Store prompt in output using delimiter for multiline
+          echo "prompt<<PROMPT_DELIMITER" >> "$GITHUB_OUTPUT"
+          cat /tmp/analysis_prompt.txt >> "$GITHUB_OUTPUT"
+          echo "PROMPT_DELIMITER" >> "$GITHUB_OUTPUT"
 
       - name: Analyze logs with Claude
         id: analyze
         uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt_file: /tmp/analysis_prompt.txt
+          direct_prompt: ${{ steps.prepare-prompt.outputs.prompt }}
           allowed_tools: ""
           max_turns: 1
 
