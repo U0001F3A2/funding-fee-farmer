@@ -127,6 +127,7 @@ jobs:
         id: analyze
         uses: anthropics/claude-code-action@beta
         with:
+          mode: agent
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           direct_prompt: ${{ steps.prepare-prompt.outputs.prompt }}
           allowed_tools: ""
