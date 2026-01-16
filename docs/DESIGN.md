@@ -386,17 +386,17 @@ Configure these in your repository: **Settings → Secrets and variables → Act
 
 | Secret | Description | How to Get |
 |--------|-------------|------------|
-| `ANTHROPIC_API_KEY` | Claude API key for analysis | [console.anthropic.com](https://console.anthropic.com) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token | From Claude Code GitHub App installation |
 | `EC2_HOST` | EC2 instance public IP | e.g., `43.203.183.140` |
 | `EC2_SSH_KEY` | Private SSH key for EC2 | Contents of `~/.ssh/fff-key.pem` |
 
 ### Setup Instructions
 
-1. **Add Anthropic API Key**
+1. **Add Claude Code OAuth Token**
    ```bash
    # Go to GitHub repo → Settings → Secrets → Actions → New repository secret
-   # Name: ANTHROPIC_API_KEY
-   # Value: sk-ant-api03-...
+   # Name: CLAUDE_CODE_OAUTH_TOKEN
+   # Value: (obtained from Claude Code GitHub App)
    ```
 
 2. **Add EC2 Host**
