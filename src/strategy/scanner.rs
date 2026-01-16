@@ -139,9 +139,12 @@ impl MarketScanner {
         let borrow_rate = margin_asset.and_then(|a| a.margin_interest_rate);
 
         if margin_asset.is_none() {
-            warn!(symbol, base_asset, "Base asset not borrowable - limited hedge options");
-            // Still allow if we can go long spot (for negative funding rates)
-            // but log a warning
+            if self.config.require_both_directions {
+                debug!(symbol, base_asset, "Base asset not borrowable - skipping (require_both_directions=true)");
+                return None;
+            } else {
+                warn!(symbol, base_asset, "Base asset not borrowable - can only go long spot (for negative funding)");
+            }
         }
 
         // Get volume
@@ -256,10 +259,11 @@ mod tests {
 
     fn test_config() -> PairSelectionConfig {
         PairSelectionConfig {
-            min_volume_24h: dec!(100_000_000),
-            min_funding_rate: dec!(0.0001),
-            max_spread: dec!(0.0002),
+            min_volume_24h: dec!(20_000_000),
+            min_funding_rate: dec!(0.00005),
+            max_spread: dec!(0.0005),
             min_open_interest: dec!(50_000_000),
+            require_both_directions: false,
         }
     }
 

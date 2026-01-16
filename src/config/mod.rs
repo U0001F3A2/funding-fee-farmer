@@ -97,6 +97,9 @@ pub struct PairSelectionConfig {
     /// Minimum open interest in USDT
     #[serde(default = "default_min_open_interest")]
     pub min_open_interest: Decimal,
+    /// Require both long and short directions (borrowable asset) for pair qualification
+    #[serde(default = "default_require_both_directions")]
+    pub require_both_directions: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,15 +144,19 @@ fn default_max_single_position() -> Decimal {
 }
 
 fn default_min_volume() -> Decimal {
-    Decimal::new(100_000_000, 0) // $100M
+    Decimal::new(20_000_000, 0) // $20M
 }
 
 fn default_min_funding_rate() -> Decimal {
-    Decimal::new(1, 4) // 0.0001 (0.01%)
+    Decimal::new(5, 5) // 0.00005 (0.005%)
 }
 
 fn default_max_spread() -> Decimal {
-    Decimal::new(2, 4) // 0.0002 (0.02%)
+    Decimal::new(5, 4) // 0.0005 (0.05%)
+}
+
+fn default_require_both_directions() -> bool {
+    false
 }
 
 fn default_min_open_interest() -> Decimal {
@@ -276,6 +283,7 @@ impl Default for Config {
                 min_funding_rate: default_min_funding_rate(),
                 max_spread: default_max_spread(),
                 min_open_interest: default_min_open_interest(),
+                require_both_directions: default_require_both_directions(),
             },
             execution: ExecutionConfig {
                 default_leverage: default_leverage(),
