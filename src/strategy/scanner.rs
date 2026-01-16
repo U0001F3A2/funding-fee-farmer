@@ -24,11 +24,12 @@ impl MarketScanner {
     #[instrument(skip(self, client))]
     pub async fn scan(&self, client: &BinanceClient) -> Result<Vec<QualifiedPair>> {
         // Fetch public data in parallel (required)
-        let (funding_rates, tickers, book_tickers, spot_info) = tokio::try_join!(
+        let (funding_rates, futures_tickers, book_tickers, spot_info, spot_tickers) = tokio::try_join!(
             client.get_funding_rates(),
             client.get_24h_tickers(),
             client.get_book_tickers(),
             client.get_spot_exchange_info(),
+            client.get_spot_24h_tickers(),
         )?;
 
         // Fetch margin assets separately (requires auth, may fail in read-only mode)
@@ -42,17 +43,26 @@ impl MarketScanner {
 
         info!(
             funding_count = funding_rates.len(),
-            ticker_count = tickers.len(),
+            futures_ticker_count = futures_tickers.len(),
+            spot_ticker_count = spot_tickers.len(),
             spot_symbols = spot_info.len(),
             margin_assets = margin_assets.len(),
             "Fetched market data"
         );
 
-        // Index data by symbol for efficient lookup
-        let volume_map: HashMap<String, Decimal> = tickers
+        // Build combined volume map (futures + spot volume for better liquidity assessment)
+        // Start with futures volume
+        let mut volume_map: HashMap<String, Decimal> = futures_tickers
             .iter()
             .map(|t| (t.symbol.clone(), t.quote_volume))
             .collect();
+
+        // Add spot volume to the same symbols
+        for spot_ticker in &spot_tickers {
+            if let Some(futures_vol) = volume_map.get_mut(&spot_ticker.symbol) {
+                *futures_vol += spot_ticker.quote_volume;
+            }
+        }
 
         let spread_map: HashMap<String, Decimal> = book_tickers
             .iter()
@@ -256,10 +266,11 @@ mod tests {
 
     fn test_config() -> PairSelectionConfig {
         PairSelectionConfig {
-            min_volume_24h: dec!(100_000_000),
+            min_volume_24h: dec!(50_000_000),
             min_funding_rate: dec!(0.0001),
             max_spread: dec!(0.0002),
             min_open_interest: dec!(50_000_000),
+            max_positions: 5,
         }
     }
 

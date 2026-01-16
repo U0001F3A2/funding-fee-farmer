@@ -10,8 +10,10 @@
 //! - `strategy`: Trading logic, opportunity scanning, and execution
 //! - `risk`: Position monitoring, margin management, and MDD tracking
 //! - `persistence`: SQLite-based state persistence for mock trading
+//! - `backtest`: Historical backtesting and parameter optimization
 //! - `utils`: Shared utilities and decimal arithmetic
 
+pub mod backtest;
 pub mod config;
 pub mod exchange;
 pub mod persistence;

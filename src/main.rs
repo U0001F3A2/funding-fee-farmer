@@ -3,12 +3,16 @@
 //! MVP version with mock trading support for paper trading and testing.
 
 use anyhow::Result;
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use clap::{Parser, Subcommand};
+use funding_fee_farmer::backtest::{
+    BacktestConfig, BacktestEngine, CsvDataLoader, DataLoader, ParameterSpace, SweepRunner,
+};
 use funding_fee_farmer::config::Config;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
 use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
-    RiskOrchestrator, RiskOrchestratorConfig, RiskAlertType, PositionEntry,
+    PositionEntry, RiskAlertType, RiskOrchestrator, RiskOrchestratorConfig,
 };
 use funding_fee_farmer::strategy::{
     CapitalAllocator, HedgeRebalancer, MarketScanner, OrderExecutor, RebalanceConfig,
@@ -22,6 +26,83 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
+
+/// Funding Fee Farmer CLI
+#[derive(Parser)]
+#[command(name = "funding-fee-farmer")]
+#[command(version, about = "Delta-neutral funding fee farming on Binance")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a backtest simulation on historical data
+    Backtest {
+        /// Path to CSV data file
+        #[arg(short, long)]
+        data: String,
+
+        /// Start date (YYYY-MM-DD)
+        #[arg(short, long)]
+        start: String,
+
+        /// End date (YYYY-MM-DD)
+        #[arg(short, long)]
+        end: String,
+
+        /// Initial balance for simulation
+        #[arg(short = 'b', long, default_value = "10000")]
+        initial_balance: f64,
+
+        /// Output directory for results
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Run a parameter sweep optimization
+    Sweep {
+        /// Path to CSV data file
+        #[arg(short, long)]
+        data: String,
+
+        /// Start date (YYYY-MM-DD)
+        #[arg(short, long)]
+        start: String,
+
+        /// End date (YYYY-MM-DD)
+        #[arg(short, long)]
+        end: String,
+
+        /// Initial balance for simulation
+        #[arg(short = 'b', long, default_value = "10000")]
+        initial_balance: f64,
+
+        /// Number of parallel backtests
+        #[arg(short, long, default_value = "4")]
+        parallelism: usize,
+
+        /// Output directory for results
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Use minimal parameter space (faster, for testing)
+        #[arg(long)]
+        minimal: bool,
+    },
+
+    /// Show current mock farmer status from persisted state
+    Status {
+        /// Path to SQLite database (default: data/mock_state.db)
+        #[arg(short, long, default_value = "data/mock_state.db")]
+        db: String,
+
+        /// Show detailed position information
+        #[arg(short, long)]
+        verbose: bool,
+    },
+}
 
 /// Trading mode: Live (real money) or Mock (paper trading).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,8 +141,50 @@ impl Default for AppMetrics {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse CLI arguments
+    let cli = Cli::parse();
+
     // Initialize comprehensive logging
     init_logging()?;
+
+    // Handle subcommands
+    match cli.command {
+        Some(Commands::Backtest {
+            data,
+            start,
+            end,
+            initial_balance,
+            output,
+        }) => {
+            return run_backtest(&data, &start, &end, initial_balance, output.as_deref()).await;
+        }
+        Some(Commands::Sweep {
+            data,
+            start,
+            end,
+            initial_balance,
+            parallelism,
+            output,
+            minimal,
+        }) => {
+            return run_sweep(
+                &data,
+                &start,
+                &end,
+                initial_balance,
+                parallelism,
+                output.as_deref(),
+                minimal,
+            )
+            .await;
+        }
+        Some(Commands::Status { db, verbose }) => {
+            return show_status(&db, verbose);
+        }
+        None => {
+            // Default: run trading mode
+        }
+    }
 
     info!("╔════════════════════════════════════════════════════════════╗");
     info!(
@@ -251,12 +374,21 @@ async fn main() -> Result<()> {
         // PHASE 3: Capital Allocation
         // ═══════════════════════════════════════════════════════════════
         if !qualified_pairs.is_empty() {
+            // Get prices first so we can convert position quantities to USDT values
+            let prices = fetch_prices(&real_client, &qualified_pairs).await;
+
+            // Convert position quantities to USDT values for the allocator
+            // The allocator compares target_size (USDT) with current position (must also be USDT)
             let current_positions: HashMap<String, Decimal> = if trading_mode == TradingMode::Mock {
                 mock_client
                     .get_delta_neutral_positions()
                     .await
                     .into_iter()
-                    .map(|p| (p.symbol, p.futures_qty))
+                    .map(|p| {
+                        let price = prices.get(&p.symbol).copied().unwrap_or(Decimal::ONE);
+                        let position_value_usdt = p.futures_qty.abs() * price;
+                        (p.symbol, position_value_usdt)
+                    })
                     .collect()
             } else {
                 match fetch_real_positions(&real_client).await {
@@ -288,8 +420,7 @@ async fn main() -> Result<()> {
                 // PHASE 4: Order Execution (Mock)
                 // ═══════════════════════════════════════════════════════════════
                 if trading_mode == TradingMode::Mock {
-                    // Update mock client with real prices
-                    let prices = fetch_prices(&real_client, &qualified_pairs).await;
+                    // Update mock client with real prices (prices already fetched above)
                     let funding_rates: HashMap<String, Decimal> = qualified_pairs
                         .iter()
                         .map(|p| (p.symbol.clone(), p.funding_rate))
@@ -1136,4 +1267,251 @@ fn log_status_with_risk(
         }
         info!("╚════════════════════════════════════════════════════════════╝");
     }
+}
+
+/// Show current mock farmer status from persisted state.
+fn show_status(db_path: &str, verbose: bool) -> Result<()> {
+    use std::path::Path;
+
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║              MOCK FARMER STATUS                            ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+
+    if !Path::new(db_path).exists() {
+        println!("\n❌ Database not found: {}", db_path);
+        println!("   The mock farmer has not been started yet, or the database path is incorrect.");
+        return Ok(());
+    }
+
+    let persistence = PersistenceManager::new(db_path)?;
+
+    let Some(state) = persistence.load_state()? else {
+        println!("\n❌ No saved state found in database.");
+        println!("   The mock farmer may not have run yet.");
+        return Ok(());
+    };
+
+    // Calculate stats
+    let pnl = state.balance - state.initial_balance;
+    let pnl_pct = if state.initial_balance > Decimal::ZERO {
+        (pnl / state.initial_balance) * dec!(100)
+    } else {
+        Decimal::ZERO
+    };
+    let net_yield = state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
+
+    println!("\n📊 Account Summary");
+    println!("   ├─ Initial Balance:  ${:.2}", state.initial_balance);
+    println!("   ├─ Current Balance:  ${:.2}", state.balance);
+    println!("   ├─ PnL:              ${:.2} ({:+.2}%)", pnl, pnl_pct);
+    println!("   └─ Last Updated:     {}", state.last_saved.format("%Y-%m-%d %H:%M:%S UTC"));
+
+    println!("\n💰 Funding & Costs");
+    println!("   ├─ Total Funding:    ${:.4}", state.total_funding_received);
+    println!("   ├─ Trading Fees:     ${:.4}", state.total_trading_fees);
+    println!("   ├─ Borrow Interest:  ${:.4}", state.total_borrow_interest);
+    println!("   └─ Net Yield:        ${:.4}", net_yield);
+
+    println!("\n📈 Activity");
+    println!("   ├─ Total Orders:     {}", state.order_count);
+    println!("   └─ Open Positions:   {}", state.positions.len());
+
+    if !state.positions.is_empty() {
+        println!("\n🔓 Open Positions");
+        for (symbol, pos) in &state.positions {
+            let pos_pnl = pos.total_funding_received - pos.total_interest_paid;
+            println!("   ┌─ {}", symbol);
+            println!("   ├─ Futures: {} @ ${:.2}", pos.futures_qty, pos.futures_entry_price);
+            println!("   ├─ Spot:    {} @ ${:.2}", pos.spot_qty, pos.spot_entry_price);
+            if pos.borrowed_amount > Decimal::ZERO {
+                println!("   ├─ Borrowed: ${:.2}", pos.borrowed_amount);
+            }
+            println!("   ├─ Funding Collected: ${:.4} ({} times)", pos.total_funding_received, pos.funding_collections);
+            if pos.total_interest_paid > Decimal::ZERO {
+                println!("   ├─ Interest Paid:    ${:.4}", pos.total_interest_paid);
+            }
+            println!("   ├─ Net P/L:          ${:.4}", pos_pnl);
+            println!("   └─ Opened:           {}", pos.opened_at.format("%Y-%m-%d %H:%M:%S UTC"));
+
+            if verbose {
+                let duration = Utc::now() - pos.opened_at;
+                let hours = duration.num_hours();
+                let funding_periods = hours / 8;
+                println!("       Duration: {}h ({} funding periods)", hours, funding_periods);
+            }
+        }
+    }
+
+    // Get funding stats per symbol
+    if verbose {
+        if let Ok(funding_stats) = persistence.get_funding_stats() {
+            if !funding_stats.is_empty() {
+                println!("\n📊 Funding by Symbol");
+                for (symbol, total) in &funding_stats {
+                    println!("   ├─ {}: ${:.4}", symbol, total);
+                }
+            }
+        }
+
+        if let Ok(snapshots) = persistence.get_recent_snapshots(5) {
+            if !snapshots.is_empty() {
+                println!("\n📉 Recent Equity Snapshots");
+                for (ts, equity) in &snapshots {
+                    println!("   ├─ {}: ${:.2}", ts.format("%Y-%m-%d %H:%M"), equity);
+                }
+            }
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Run a single backtest with the given parameters.
+async fn run_backtest(
+    data_path: &str,
+    start_str: &str,
+    end_str: &str,
+    initial_balance: f64,
+    output_dir: Option<&str>,
+) -> Result<()> {
+    info!("╔════════════════════════════════════════════════════════════╗");
+    info!("║              BACKTEST MODE                                 ║");
+    info!("╚════════════════════════════════════════════════════════════╝");
+
+    // Parse dates
+    let start_date = NaiveDate::parse_from_str(start_str, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("Invalid start date '{}': {}", start_str, e))?;
+    let end_date = NaiveDate::parse_from_str(end_str, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("Invalid end date '{}': {}", end_str, e))?;
+
+    let start = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let end = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+
+    info!("📊 Loading data from: {}", data_path);
+    let data_loader = CsvDataLoader::new(data_path)?;
+
+    if let Some((data_start, data_end)) = data_loader.available_range() {
+        info!(
+            "   Data range: {} to {}",
+            data_start.format("%Y-%m-%d"),
+            data_end.format("%Y-%m-%d")
+        );
+    }
+
+    info!("   Symbols: {}", data_loader.available_symbols().len());
+    info!("   Snapshots: {}", data_loader.len());
+
+    // Load trading config
+    let config = Config::load()?;
+
+    // Create backtest config
+    let backtest_config = BacktestConfig {
+        initial_balance: Decimal::from_f64_retain(initial_balance).unwrap_or(dec!(10000)),
+        time_step_minutes: 60,
+        record_equity_curve: true,
+        record_trades: true,
+        output_path: output_dir.map(String::from),
+    };
+
+    info!("💰 Initial balance: ${:.2}", initial_balance);
+    info!("📅 Period: {} to {}", start_str, end_str);
+
+    // Run backtest
+    let mut engine = BacktestEngine::new(data_loader, config, backtest_config);
+    let result = engine.run(start, end).await?;
+
+    // Print results
+    println!("\n{}", result.summary());
+
+    // Save results if output directory specified
+    if let Some(dir) = output_dir {
+        std::fs::create_dir_all(dir)?;
+
+        let equity_path = format!("{}/equity_curve.csv", dir);
+        result.equity_to_csv(&equity_path)?;
+        info!("📁 Equity curve saved to: {}", equity_path);
+    }
+
+    Ok(())
+}
+
+/// Run a parameter sweep optimization.
+async fn run_sweep(
+    data_path: &str,
+    start_str: &str,
+    end_str: &str,
+    initial_balance: f64,
+    parallelism: usize,
+    output_dir: Option<&str>,
+    minimal: bool,
+) -> Result<()> {
+    info!("╔════════════════════════════════════════════════════════════╗");
+    info!("║           PARAMETER SWEEP MODE                             ║");
+    info!("╚════════════════════════════════════════════════════════════╝");
+
+    // Parse dates
+    let start_date = NaiveDate::parse_from_str(start_str, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("Invalid start date '{}': {}", start_str, e))?;
+    let end_date = NaiveDate::parse_from_str(end_str, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("Invalid end date '{}': {}", end_str, e))?;
+
+    let start = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let end = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+
+    info!("📊 Loading data from: {}", data_path);
+    let data_loader = CsvDataLoader::new(data_path)?;
+
+    if let Some((data_start, data_end)) = data_loader.available_range() {
+        info!(
+            "   Data range: {} to {}",
+            data_start.format("%Y-%m-%d"),
+            data_end.format("%Y-%m-%d")
+        );
+    }
+
+    // Load base config
+    let base_config = Config::load()?;
+
+    // Create parameter space
+    let param_space = if minimal {
+        info!("🔧 Using minimal parameter space (quick test)");
+        ParameterSpace::minimal()
+    } else {
+        info!("🔧 Using full parameter space");
+        ParameterSpace::default()
+    };
+
+    info!("   Combinations to test: {}", param_space.combination_count());
+
+    // Create backtest config
+    let backtest_config = BacktestConfig {
+        initial_balance: Decimal::from_f64_retain(initial_balance).unwrap_or(dec!(10000)),
+        time_step_minutes: 60,
+        record_equity_curve: false, // Save memory during sweeps
+        record_trades: false,
+        output_path: None,
+    };
+
+    info!("💰 Initial balance: ${:.2}", initial_balance);
+    info!("📅 Period: {} to {}", start_str, end_str);
+    info!("⚡ Parallelism: {}", parallelism);
+
+    // Create and run sweep
+    let runner = SweepRunner::new(param_space, base_config, backtest_config, parallelism);
+    let results = runner.run(data_loader, start, end).await?;
+
+    // Print summary
+    println!("\n{}", results.summary());
+
+    // Save results if output directory specified
+    if let Some(dir) = output_dir {
+        std::fs::create_dir_all(dir)?;
+
+        let results_path = format!("{}/sweep_results.csv", dir);
+        results.to_csv(&results_path)?;
+        info!("📁 Sweep results saved to: {}", results_path);
+    }
+
+    Ok(())
 }

@@ -102,6 +102,23 @@ impl BinanceClient {
             .context("Failed to parse 24h ticker response")
     }
 
+    /// Get 24-hour ticker for all spot symbols.
+    #[instrument(skip(self))]
+    pub async fn get_spot_24h_tickers(&self) -> Result<Vec<Ticker24h>> {
+        let url = format!("{}/api/v3/ticker/24hr", self.spot_base_url);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch spot 24h tickers")?;
+
+        response
+            .json()
+            .await
+            .context("Failed to parse spot 24h ticker response")
+    }
+
     /// Get best bid/ask for all symbols.
     #[instrument(skip(self))]
     pub async fn get_book_tickers(&self) -> Result<Vec<BookTicker>> {

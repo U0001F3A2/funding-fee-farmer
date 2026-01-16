@@ -33,3 +33,9 @@ Thumbs.db
 *.tmp
 *.temp
 env.tar.gz
+
+# Data directory (backtest data, mock state DB)
+data/
+
+# Serena MCP config
+.serena/

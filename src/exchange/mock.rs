@@ -113,6 +113,36 @@ impl MockBinanceClient {
         *self.prices.write().await = prices;
     }
 
+    /// Alias for update_market_data (used by backtesting engine).
+    pub async fn set_market_data(
+        &self,
+        funding_rates: HashMap<String, Decimal>,
+        prices: HashMap<String, Decimal>,
+    ) {
+        self.update_market_data(funding_rates, prices).await;
+    }
+
+    /// Reset all state for a new backtest run (parameter sweep).
+    pub async fn reset(&self, initial_balance: Decimal) {
+        let mut state = self.state.write().await;
+        state.initial_balance = initial_balance;
+        state.balance = initial_balance;
+        state.positions.clear();
+        state.total_funding_received = Decimal::ZERO;
+        state.total_trading_fees = Decimal::ZERO;
+        state.total_borrow_interest = Decimal::ZERO;
+        state.order_count = 0;
+
+        // Reset order ID counter
+        self.order_id_counter.store(1, Ordering::SeqCst);
+
+        // Clear market data
+        self.funding_rates.write().await.clear();
+        self.prices.write().await.clear();
+
+        debug!(balance = %initial_balance, "Mock client state reset");
+    }
+
     /// Get current mock state for logging.
     pub async fn get_state(&self) -> MockTradingState {
         let state = self.state.read().await;
