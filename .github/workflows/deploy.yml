@@ -1,0 +1,78 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/fff-key.pem
+          chmod 600 ~/.ssh/fff-key.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Stop service on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ec2-user
+        run: |
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo systemctl stop funding-fee-farmer || true"
+
+      - name: Deploy binary to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ec2-user
+        run: |
+          scp -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            target/release/funding-fee-farmer \
+            "$EC2_USER@$EC2_HOST:/tmp/funding-fee-farmer"
+
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo mv /tmp/funding-fee-farmer /usr/local/bin/funding-fee-farmer && sudo chmod +x /usr/local/bin/funding-fee-farmer"
+
+      - name: Start service on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ec2-user
+        run: |
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo systemctl start funding-fee-farmer"
+
+      - name: Verify deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ec2-user
+        run: |
+          sleep 5
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo systemctl status funding-fee-farmer --no-pager | head -10"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/fff-key.pem
