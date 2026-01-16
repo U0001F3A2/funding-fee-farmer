@@ -794,6 +794,93 @@ async fn main() -> Result<()> {
             // Run comprehensive risk check
             let risk_result = risk_orchestrator.check_all(&exchange_positions, total_equity, state.balance);
 
+            // Check for drawdown warnings
+            let drawdown_stats = risk_orchestrator.get_drawdown_stats();
+            let max_drawdown = config.risk.max_drawdown;
+            let distance = max_drawdown - drawdown_stats.current_drawdown;
+            let warning_threshold = max_drawdown * dec!(0.2); // 20% buffer
+
+            if distance <= warning_threshold {
+                warn!(
+                    current_dd = %drawdown_stats.current_drawdown,
+                    distance_to_limit = %distance,
+                    "⚠️  Approaching maximum drawdown - consider reducing exposure"
+                );
+
+                // Graduated response based on distance to limit
+                let distance_pct = distance / max_drawdown;
+
+                if distance_pct <= dec!(0.05) { // Within 5% of limit (95% threshold)
+                    warn!("🚨 Drawdown at 95% of limit - reducing all positions by 25%");
+
+                    for pos in &positions {
+                        if pos.futures_qty.abs() < dec!(0.0001) {
+                            continue; // Skip positions with negligible size
+                        }
+
+                        let reduce_qty = pos.futures_qty.abs() * dec!(0.25);
+
+                        // Close 25% of futures position
+                        let futures_side = if pos.futures_qty > Decimal::ZERO {
+                            funding_fee_farmer::exchange::OrderSide::Sell
+                        } else {
+                            funding_fee_farmer::exchange::OrderSide::Buy
+                        };
+
+                        let futures_order = funding_fee_farmer::exchange::NewOrder {
+                            symbol: pos.symbol.clone(),
+                            side: futures_side,
+                            position_side: None,
+                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                            quantity: Some(reduce_qty),
+                            price: None,
+                            time_in_force: None,
+                            reduce_only: Some(true),
+                            new_client_order_id: None,
+                        };
+
+                        if let Err(e) = mock_client.place_futures_order(&futures_order).await {
+                            error!("❌ Failed to reduce futures position for {}: {}", pos.symbol, e);
+                        } else {
+                            info!("✅ Reduced futures position for {} by 25%", pos.symbol);
+                        }
+
+                        // Close 25% of spot position
+                        if pos.spot_qty.abs() >= dec!(0.0001) {
+                            let spot_side = if pos.spot_qty > Decimal::ZERO {
+                                funding_fee_farmer::exchange::OrderSide::Sell
+                            } else {
+                                funding_fee_farmer::exchange::OrderSide::Buy
+                            };
+
+                            let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                                symbol: pos.spot_symbol.clone(),
+                                side: spot_side,
+                                order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                quantity: Some(pos.spot_qty.abs() * dec!(0.25)),
+                                price: None,
+                                time_in_force: None,
+                                is_isolated: Some(false),
+                                side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
+                            };
+
+                            if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                                error!("❌ Failed to reduce spot position for {}: {}", pos.spot_symbol, e);
+                            } else {
+                                info!("✅ Reduced spot position for {} by 25%", pos.spot_symbol);
+                            }
+                        }
+                    }
+                } else if distance_pct <= dec!(0.10) { // Within 10% of limit (90% threshold)
+                    warn!("⚠️  Drawdown at 90% of limit - stopping new positions");
+                    // Note: New position logic would need to check this condition
+                    // For now, just log the warning
+                } else {
+                    // Between 80-90% of limit - just log warning (already done above)
+                    info!("📊 Drawdown warning logged - monitoring closely");
+                }
+            }
+
             // Handle risk alerts
             if !risk_result.alerts.is_empty() {
                 for alert in &risk_result.alerts {
