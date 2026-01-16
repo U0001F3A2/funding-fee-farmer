@@ -23,7 +23,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # Shallow clone to avoid pushing commits that modified workflow files
+          # (which would require 'workflows' permission)
+          fetch-depth: 1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,19 +66,20 @@ jobs:
           BRANCH_NAME="claude/issue-${ISSUE_NUM}"
           echo "name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Check if branch exists
+      - name: Create feature branch
         id: check-branch
         env:
           BRANCH_NAME: ${{ steps.branch.outputs.name }}
         run: |
+          # With shallow clone, always create a fresh branch from HEAD
+          # This ensures we don't include workflow-modifying commits in push history
           if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            git fetch origin "$BRANCH_NAME"
-            git checkout "$BRANCH_NAME"
+            # Branch exists - we'll force-push our changes
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            git checkout -b "$BRANCH_NAME"
           fi
+          git checkout -b "$BRANCH_NAME"
 
       - name: Prepare implementation prompt
         id: prepare-prompt
@@ -154,6 +157,7 @@ jobs:
         env:
           ISSUE_NUM: ${{ steps.issue.outputs.number }}
           BRANCH_NAME: ${{ steps.branch.outputs.name }}
+          BRANCH_EXISTS: ${{ steps.check-branch.outputs.exists }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -169,7 +173,12 @@ jobs:
 
           Co-Authored-By: Claude <noreply@anthropic.com>"
 
-          git push -u origin "$BRANCH_NAME"
+          # Force push if branch exists (shallow clone means fresh history)
+          if [ "$BRANCH_EXISTS" = "true" ]; then
+            git push -u origin "$BRANCH_NAME" --force
+          else
+            git push -u origin "$BRANCH_NAME"
+          fi
 
       - name: Create or update Pull Request
         if: steps.changes.outputs.has_changes == 'true'
