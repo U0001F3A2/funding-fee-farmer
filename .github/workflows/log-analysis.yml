@@ -123,30 +123,37 @@ jobs:
           cat /tmp/analysis_prompt.txt >> "$GITHUB_OUTPUT"
           echo "PROMPT_DELIMITER" >> "$GITHUB_OUTPUT"
 
-      - name: Analyze logs with Claude
+      - name: Analyze logs with Claude API
         id: analyze
-        uses: anthropics/claude-code-action@beta
-        with:
-          mode: agent
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          direct_prompt: |
-            ${{ steps.prepare-prompt.outputs.prompt }}
-
-            IMPORTANT: After your analysis, you MUST write the JSON result to the file `/tmp/analysis_result.json` using the Write tool.
-            The file should contain ONLY the raw JSON object, no markdown formatting.
-          allowed_tools: "Write"
-          max_turns: 3
-
-      - name: Check analysis result
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -f /tmp/analysis_result.json ]; then
-            echo "Analysis file found:"
-            cat /tmp/analysis_result.json
-            cp /tmp/analysis_result.json /tmp/analysis_result.txt
+          # Build the prompt
+          PROMPT=$(cat /tmp/analysis_prompt.txt)
+
+          # Call Claude API directly
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg prompt "$PROMPT" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 4096,
+                messages: [{role: "user", content: $prompt}]
+              }')")
+
+          # Extract the text content from the response
+          ANALYSIS=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+          if [ -z "$ANALYSIS" ]; then
+            echo "API call failed or returned empty response"
+            echo "Response: $RESPONSE"
+            echo '{"health_status": "unknown", "summary": "API call failed", "errors": [], "improvements": []}' > /tmp/analysis_result.txt
           else
-            echo "No analysis file found, creating fallback"
-            echo '{"health_status": "unknown", "summary": "Claude did not produce analysis output", "errors": [], "improvements": []}' > /tmp/analysis_result.txt
+            echo "Analysis received (${#ANALYSIS} chars)"
+            echo "$ANALYSIS" > /tmp/analysis_result.txt
           fi
 
       - name: Parse analysis and create issues
