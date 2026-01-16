@@ -45,21 +45,24 @@ jobs:
           ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
             "$EC2_USER@$EC2_HOST" \
             "sudo journalctl -u funding-fee-farmer --since '${HOURS} hours ago' --no-pager 2>/dev/null | tail -500" \
-            > /tmp/recent_logs.txt
+            > /tmp/recent_logs.txt || true
 
           # Also get current service status
           ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
             "$EC2_USER@$EC2_HOST" \
             "sudo systemctl status funding-fee-farmer --no-pager 2>/dev/null | head -20" \
-            > /tmp/service_status.txt
+            > /tmp/service_status.txt || true
 
-          # Count errors and warnings
-          ERROR_COUNT=$(grep -c "ERROR\|❌" /tmp/recent_logs.txt || echo "0")
-          WARN_COUNT=$(grep -c "WARN\|⚠" /tmp/recent_logs.txt || echo "0")
+          # Count errors and warnings (handle grep returning 1 when no matches)
+          ERROR_COUNT="$(grep -c -E 'ERROR|❌' /tmp/recent_logs.txt 2>/dev/null)" || ERROR_COUNT="0"
+          WARN_COUNT="$(grep -c -E 'WARN|⚠' /tmp/recent_logs.txt 2>/dev/null)" || WARN_COUNT="0"
 
-          echo "error_count=$ERROR_COUNT" >> "$GITHUB_OUTPUT"
-          echo "warn_count=$WARN_COUNT" >> "$GITHUB_OUTPUT"
-          echo "hours=$HOURS" >> "$GITHUB_OUTPUT"
+          # Write outputs
+          {
+            echo "error_count=${ERROR_COUNT}"
+            echo "warn_count=${WARN_COUNT}"
+            echo "hours=${HOURS}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare analysis prompt
         id: prepare-prompt
