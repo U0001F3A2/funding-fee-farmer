@@ -4,10 +4,10 @@
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Main application configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Binance API credentials
     pub binance: BinanceConfig,
@@ -21,7 +21,7 @@ pub struct Config {
     pub execution: ExecutionConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceConfig {
     /// API key for authentication
     pub api_key: String,
@@ -32,7 +32,7 @@ pub struct BinanceConfig {
     pub testnet: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapitalConfig {
     /// Maximum percentage of capital to deploy (0.0-1.0)
     #[serde(default = "default_max_utilization")]
@@ -45,7 +45,7 @@ pub struct CapitalConfig {
     pub min_position_size: Decimal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
     /// Maximum allowable drawdown (0.0-1.0)
     #[serde(default = "default_max_drawdown")]
@@ -83,7 +83,7 @@ pub struct RiskConfig {
     pub emergency_delta_drift: Decimal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairSelectionConfig {
     /// Minimum 24h trading volume in USDT
     #[serde(default = "default_min_volume")]
@@ -97,9 +97,12 @@ pub struct PairSelectionConfig {
     /// Minimum open interest in USDT
     #[serde(default = "default_min_open_interest")]
     pub min_open_interest: Decimal,
+    /// Maximum number of concurrent positions (concentrate capital)
+    #[serde(default = "default_max_positions")]
+    pub max_positions: u8,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConfig {
     /// Default leverage for positions
     #[serde(default = "default_leverage")]
@@ -141,11 +144,11 @@ fn default_max_single_position() -> Decimal {
 }
 
 fn default_min_volume() -> Decimal {
-    Decimal::new(100_000_000, 0) // $100M
+    Decimal::new(50_000_000, 0) // $50M combined spot+futures volume
 }
 
 fn default_min_funding_rate() -> Decimal {
-    Decimal::new(1, 4) // 0.0001 (0.01%)
+    Decimal::new(5, 4) // 0.0005 (0.05%) - focus on high-yield pairs
 }
 
 fn default_max_spread() -> Decimal {
@@ -154,6 +157,10 @@ fn default_max_spread() -> Decimal {
 
 fn default_min_open_interest() -> Decimal {
     Decimal::new(50_000_000, 0) // $50M
+}
+
+fn default_max_positions() -> u8 {
+    5 // Concentrate capital into top pairs
 }
 
 fn default_leverage() -> u8 {
@@ -276,6 +283,7 @@ impl Default for Config {
                 min_funding_rate: default_min_funding_rate(),
                 max_spread: default_max_spread(),
                 min_open_interest: default_min_open_interest(),
+                max_positions: default_max_positions(),
             },
             execution: ExecutionConfig {
                 default_leverage: default_leverage(),
