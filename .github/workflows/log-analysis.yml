@@ -123,38 +123,22 @@ jobs:
           cat /tmp/analysis_prompt.txt >> "$GITHUB_OUTPUT"
           echo "PROMPT_DELIMITER" >> "$GITHUB_OUTPUT"
 
-      - name: Analyze logs with Claude API
+      - name: Analyze logs with Claude
         id: analyze
+        uses: anthropics/claude-code-action@beta
+        with:
+          mode: agent
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          direct_prompt: ${{ steps.prepare-prompt.outputs.prompt }}
+          allowed_tools: ""
+          max_turns: 1
+
+      - name: Save analysis result
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANALYSIS_RESULT: ${{ steps.analyze.outputs.result }}
         run: |
-          # Build the prompt
-          PROMPT=$(cat /tmp/analysis_prompt.txt)
-
-          # Call Claude API directly
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d "$(jq -n \
-              --arg prompt "$PROMPT" \
-              '{
-                model: "claude-sonnet-4-20250514",
-                max_tokens: 4096,
-                messages: [{role: "user", content: $prompt}]
-              }')")
-
-          # Extract the text content from the response
-          ANALYSIS=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
-
-          if [ -z "$ANALYSIS" ]; then
-            echo "API call failed or returned empty response"
-            echo "Response: $RESPONSE"
-            echo '{"health_status": "unknown", "summary": "API call failed", "errors": [], "improvements": []}' > /tmp/analysis_result.txt
-          else
-            echo "Analysis received (${#ANALYSIS} chars)"
-            echo "$ANALYSIS" > /tmp/analysis_result.txt
-          fi
+          echo "$ANALYSIS_RESULT" > /tmp/analysis_result.txt
 
       - name: Parse analysis and create issues
         uses: actions/github-script@v7
@@ -166,183 +150,93 @@ jobs:
             const fs = require('fs');
             const analysisOutput = fs.readFileSync('/tmp/analysis_result.txt', 'utf8');
 
-            console.log('Raw analysis output length:', analysisOutput.length);
-            console.log('First 500 chars:', analysisOutput.substring(0, 500));
-
-            // Try multiple patterns to extract JSON from the response
+            // Try to extract JSON from the response
             let analysis;
-            const jsonPatterns = [
-              /```json\s*([\s\S]*?)\s*```/,           // Standard markdown JSON block
-              /```\s*([\s\S]*?)\s*```/,               // Any code block
-              /\{[\s\S]*"health_status"[\s\S]*\}/,    // Raw JSON object with health_status
-              /\{[\s\S]*"improvements"[\s\S]*\}/,     // Raw JSON object with improvements
-            ];
-
-            let jsonStr = null;
-            for (const pattern of jsonPatterns) {
-              const match = analysisOutput.match(pattern);
-              if (match) {
-                jsonStr = match[1] || match[0];
-                console.log('Matched pattern:', pattern.toString().substring(0, 30));
-                break;
-              }
-            }
-
             try {
-              if (jsonStr) {
-                // Clean up the JSON string
-                jsonStr = jsonStr.trim();
-                analysis = JSON.parse(jsonStr);
-                console.log('Successfully parsed JSON');
+              const jsonMatch = analysisOutput.match(/```json\n?([\s\S]*?)\n?```/);
+              if (jsonMatch) {
+                analysis = JSON.parse(jsonMatch[1]);
               } else {
                 // Try parsing the whole output as JSON
-                analysis = JSON.parse(analysisOutput.trim());
+                analysis = JSON.parse(analysisOutput);
               }
             } catch (e) {
-              console.log('JSON parse error:', e.message);
-
-              // Check if we should skip creating an issue (no critical problems)
-              const errorCount = parseInt(process.env.ERROR_COUNT) || 0;
-              const warnCount = parseInt(process.env.WARN_COUNT) || 0;
-
-              // If no errors and few warnings, the bot is healthy - don't create noise
-              if (errorCount === 0 && warnCount < 50) {
-                console.log('Bot appears healthy (0 errors, few warnings). Skipping issue creation.');
-                return;
-              }
-
-              // Create issue with the actual analysis text for review
+              console.log('Could not parse JSON from analysis, creating summary issue');
               const today = new Date().toISOString().split('T')[0];
-              const truncatedAnalysis = analysisOutput.length > 3000
-                ? analysisOutput.substring(0, 3000) + '\n\n... (truncated)'
-                : analysisOutput;
-
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: `[Log Analysis] Review needed - ${today}`,
-                body: `## Automated Log Analysis\n\n**Errors**: ${errorCount}\n**Warnings**: ${warnCount}\n\n### Claude's Analysis\n\n${truncatedAnalysis}\n\n---\n*JSON parsing failed. Please review the analysis above.*`,
+                body: `## Automated Log Analysis\n\n**Errors**: ${process.env.ERROR_COUNT}\n**Warnings**: ${process.env.WARN_COUNT}\n\nCould not parse structured analysis. Please review logs manually.`,
                 labels: ['log-analysis', 'needs-review']
               });
               return;
             }
 
-            // Log summary first
-            console.log(`Health: ${analysis.health_status}`);
-            console.log(`Summary: ${analysis.summary}`);
-            console.log(`Errors found: ${(analysis.errors || []).length}`);
-            console.log(`Improvements identified: ${(analysis.improvements || []).length}`);
-
-            // Helper to check for existing issues
-            async function issueExists(labelFilter, titleSubstring) {
-              const existingIssues = await github.rest.issues.listForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                labels: labelFilter
-              });
-              return existingIssues.data.some(issue => issue.title.includes(titleSubstring));
-            }
-
-            // CRITICAL/DEGRADED health status - create urgent issue
-            if (analysis.health_status === 'critical' || analysis.health_status === 'degraded') {
-              const exists = await issueExists('urgent', analysis.health_status);
-              if (!exists) {
-                const errorsSection = (analysis.errors || [])
-                  .map(e => `- **${e.message}** (${e.count}x)\n  - Cause: ${e.cause}\n  - Fix: ${e.fix}`)
-                  .join('\n') || 'No specific errors identified';
-
-                await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: `🚨 [URGENT] Bot health ${analysis.health_status.toUpperCase()}`,
-                  body: [
-                    `## Health Status: ${analysis.health_status.toUpperCase()}`,
-                    '',
-                    `**Summary**: ${analysis.summary}`,
-                    '',
-                    '### Errors',
-                    errorsSection,
-                    '',
-                    '---',
-                    '*This issue was automatically created due to abnormal bot behavior.*',
-                    '',
-                    '@claude please investigate and fix this issue urgently.'
-                  ].join('\n'),
-                  labels: ['urgent', 'automated', analysis.health_status]
-                });
-                console.log(`Created urgent issue for ${analysis.health_status} health`);
-              }
-            }
-
-            // Create issues for HIGH priority improvements
+            // Create issues for HIGH priority improvements only
             const highPriorityImprovements = (analysis.improvements || [])
               .filter(i => i.priority === 'HIGH');
 
             for (const improvement of highPriorityImprovements) {
-              const titlePrefix = improvement.title.substring(0, 30);
-              const exists = await issueExists('claude-improvement', titlePrefix);
+              // Check if similar issue already exists
+              const existingIssues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'claude-improvement'
+              });
 
-              if (!exists) {
+              const titlePrefix = improvement.title.substring(0, 30);
+              const similarExists = existingIssues.data.some(
+                issue => issue.title.includes(titlePrefix)
+              );
+
+              if (!similarExists) {
                 const filesSection = (improvement.files_to_modify || [])
                   .map(f => `- \`${f}\``)
                   .join('\n') || '- TBD';
+
+                const body = [
+                  '## Automated Improvement Suggestion',
+                  '',
+                  `**Priority**: ${improvement.priority}`,
+                  `**Effort**: ${improvement.effort}`,
+                  `**Impact**: ${improvement.impact}`,
+                  '',
+                  '### Description',
+                  improvement.description,
+                  '',
+                  '### Files to Modify',
+                  filesSection,
+                  '',
+                  '### Suggested Approach',
+                  improvement.suggested_approach,
+                  '',
+                  '---',
+                  '*This issue was automatically created by log analysis.*',
+                  '',
+                  '@claude please implement this improvement.'
+                ].join('\n');
 
                 await github.rest.issues.create({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   title: `[Auto] ${improvement.title}`,
-                  body: [
-                    '## Automated Improvement Suggestion',
-                    '',
-                    `**Priority**: ${improvement.priority}`,
-                    `**Effort**: ${improvement.effort}`,
-                    `**Impact**: ${improvement.impact}`,
-                    '',
-                    '### Description',
-                    improvement.description,
-                    '',
-                    '### Files to Modify',
-                    filesSection,
-                    '',
-                    '### Suggested Approach',
-                    improvement.suggested_approach,
-                    '',
-                    '---',
-                    '*This issue was automatically created by log analysis.*',
-                    '',
-                    '@claude please implement this improvement.'
-                  ].join('\n'),
+                  body: body,
                   labels: ['claude-improvement', 'automated', improvement.priority.toLowerCase()]
                 });
+
                 console.log(`Created issue: ${improvement.title}`);
               } else {
                 console.log(`Skipping duplicate: ${improvement.title}`);
               }
             }
 
-            // If healthy with no issues, close any stale "Review needed" issues
-            if (analysis.health_status === 'healthy' && (analysis.errors || []).length === 0) {
-              const staleIssues = await github.rest.issues.listForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                labels: 'needs-review'
-              });
-
-              for (const issue of staleIssues.data) {
-                if (issue.title.includes('[Log Analysis] Review needed')) {
-                  await github.rest.issues.update({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: issue.number,
-                    state: 'closed',
-                    state_reason: 'completed'
-                  });
-                  console.log(`Closed stale issue #${issue.number}: ${issue.title}`);
-                }
-              }
-            }
+            // Log summary
+            console.log(`Health: ${analysis.health_status}`);
+            console.log(`Summary: ${analysis.summary}`);
+            console.log(`Errors found: ${(analysis.errors || []).length}`);
+            console.log(`Improvements identified: ${(analysis.improvements || []).length}`);
 
       - name: Cleanup
         if: always()
