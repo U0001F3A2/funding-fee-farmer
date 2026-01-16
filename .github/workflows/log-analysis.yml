@@ -126,6 +126,8 @@ jobs:
       - name: Analyze logs with Claude
         id: analyze
         uses: anthropics/claude-code-action@beta
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
           mode: agent
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
