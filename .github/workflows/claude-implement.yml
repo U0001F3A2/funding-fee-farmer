@@ -134,14 +134,12 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@v1
         with:
-          mode: agent
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          direct_prompt: ${{ steps.prepare-prompt.outputs.prompt }}
-          allowed_tools: "Bash,Read,Write,Edit,Glob,Grep"
-          max_turns: 30
+          prompt: ${{ steps.prepare-prompt.outputs.prompt }}
+          claude_args: --allowedTools "Bash,Read,Write,Edit,Glob,Grep"
 
       - name: Check for changes
         id: changes
