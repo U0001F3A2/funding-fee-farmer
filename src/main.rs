@@ -791,6 +791,112 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Check drawdown warnings with graduated response
+            let (warning_level, current_dd, max_dd, distance) = risk_orchestrator.check_drawdown_warning();
+
+            match warning_level {
+                1 => {
+                    // Warning: 80-90% of limit
+                    warn!(
+                        current_dd = %current_dd,
+                        max_dd = %max_dd,
+                        distance = %distance,
+                        usage_pct = %(current_dd / max_dd * dec!(100)),
+                        "⚠️  DRAWDOWN WARNING: Approaching limit - monitor closely"
+                    );
+                }
+                2 => {
+                    // Critical: 90-95% of limit - Stop new positions
+                    error!(
+                        current_dd = %current_dd,
+                        max_dd = %max_dd,
+                        distance = %distance,
+                        usage_pct = %(current_dd / max_dd * dec!(100)),
+                        "🚨 DRAWDOWN CRITICAL: Stop opening new positions"
+                    );
+                    // TODO: Add flag to prevent new position entries
+                }
+                3 => {
+                    // Emergency: 95-100% of limit - Reduce existing positions
+                    error!(
+                        current_dd = %current_dd,
+                        max_dd = %max_dd,
+                        distance = %distance,
+                        usage_pct = %(current_dd / max_dd * dec!(100)),
+                        "🚨 DRAWDOWN EMERGENCY: Reducing positions by 25%"
+                    );
+
+                    // Reduce all positions by 25%
+                    let positions_to_reduce = mock_client.get_delta_neutral_positions().await;
+                    for position in positions_to_reduce.iter().take(5) { // Limit to avoid excessive orders
+                        let reduction_qty = position.futures_qty.abs() * dec!(0.25);
+
+                        if reduction_qty > dec!(0.001) {
+                            // Reduce futures position
+                            let futures_side = if position.futures_qty > Decimal::ZERO {
+                                funding_fee_farmer::exchange::OrderSide::Sell
+                            } else {
+                                funding_fee_farmer::exchange::OrderSide::Buy
+                            };
+
+                            let futures_order = funding_fee_farmer::exchange::NewOrder {
+                                symbol: position.symbol.clone(),
+                                side: futures_side,
+                                position_side: None,
+                                order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                quantity: Some(reduction_qty),
+                                price: None,
+                                time_in_force: None,
+                                reduce_only: Some(true),
+                                new_client_order_id: None,
+                            };
+
+                            if let Err(e) = mock_client.place_futures_order(&futures_order).await {
+                                warn!("⚠️  [DRAWDOWN] Failed to reduce futures position {}: {}", position.symbol, e);
+                            }
+
+                            // Reduce spot position
+                            let spot_side = if position.spot_qty > Decimal::ZERO {
+                                funding_fee_farmer::exchange::OrderSide::Sell
+                            } else {
+                                funding_fee_farmer::exchange::OrderSide::Buy
+                            };
+
+                            let spot_qty_reduction = position.spot_qty.abs() * dec!(0.25);
+                            if spot_qty_reduction > dec!(0.001) {
+                                let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                                    symbol: position.spot_symbol.clone(),
+                                    side: spot_side,
+                                    order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                    quantity: Some(spot_qty_reduction),
+                                    price: None,
+                                    time_in_force: None,
+                                    is_isolated: Some(false),
+                                    side_effect_type: Some(
+                                        funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                                    ),
+                                };
+
+                                if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                                    warn!("⚠️  [DRAWDOWN] Failed to reduce spot position {}: {}", position.spot_symbol, e);
+                                } else {
+                                    info!("✅ [DRAWDOWN] Reduced position {} by 25%", position.symbol);
+                                }
+                            }
+                        }
+                    }
+                }
+                4 => {
+                    // Already handled by risk_result.should_halt, but log for clarity
+                    error!(
+                        current_dd = %current_dd,
+                        max_dd = %max_dd,
+                        "🚨 DRAWDOWN EXCEEDED: Emergency shutdown initiated"
+                    );
+                }
+                _ => {} // Safe - no action needed
+            }
+
             // Check halt conditions
             if risk_result.should_halt {
                 error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");
@@ -1092,9 +1198,28 @@ fn log_status_with_risk(
     );
     info!("╠════════════════════════════════════════════════════════════╣");
     info!("║ ⚠️  RISK                                                   ║");
+
+    // Calculate drawdown warning level
+    let dd_usage_pct = if drawdown_stats.current_drawdown > Decimal::ZERO && risk_orchestrator.get_drawdown_stats().peak_equity > Decimal::ZERO {
+        drawdown_stats.current_drawdown / dec!(0.05) * dec!(100) // Assume 5% max for display
+    } else {
+        Decimal::ZERO
+    };
+
+    let warning_indicator = if dd_usage_pct >= dec!(95.0) {
+        "🚨 EMERGENCY"
+    } else if dd_usage_pct >= dec!(90.0) {
+        "⚠️  CRITICAL "
+    } else if dd_usage_pct >= dec!(80.0) {
+        "⚠️  WARNING  "
+    } else {
+        "✅ SAFE     "
+    };
+
     info!(
-        "║    Current Drawdown:   {:>6.2}%                            ",
-        drawdown_stats.current_drawdown * dec!(100)
+        "║    Current Drawdown:   {:>6.2}% {} (Max: 5.00%)      ",
+        drawdown_stats.current_drawdown * dec!(100),
+        warning_indicator
     );
     info!(
         "║    Session MDD:        {:>6.2}%                            ",

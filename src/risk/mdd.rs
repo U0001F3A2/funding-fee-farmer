@@ -112,6 +112,35 @@ impl DrawdownTracker {
         (distance <= warning_threshold, distance)
     }
 
+    /// Get the warning level based on proximity to max drawdown.
+    ///
+    /// Returns:
+    /// - 0: Safe (< 80% of limit)
+    /// - 1: Warning (80-90% of limit)
+    /// - 2: Critical (90-95% of limit)
+    /// - 3: Emergency (95-100% of limit)
+    /// - 4: Exceeded (>= 100% of limit)
+    pub fn warning_level(&self) -> u8 {
+        let usage_pct = self.current_drawdown / self.max_drawdown;
+
+        if usage_pct >= dec!(1.0) {
+            4 // Exceeded
+        } else if usage_pct >= dec!(0.95) {
+            3 // Emergency (95-100%)
+        } else if usage_pct >= dec!(0.90) {
+            2 // Critical (90-95%)
+        } else if usage_pct >= dec!(0.80) {
+            1 // Warning (80-90%)
+        } else {
+            0 // Safe
+        }
+    }
+
+    /// Get the maximum allowed drawdown.
+    pub fn max_drawdown(&self) -> Decimal {
+        self.max_drawdown
+    }
+
     /// Calculate Calmar ratio (annual return / max drawdown).
     ///
     /// This requires enough history to estimate annual return.

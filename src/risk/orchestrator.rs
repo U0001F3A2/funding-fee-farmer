@@ -539,6 +539,23 @@ impl RiskOrchestrator {
     pub fn reset_halt(&mut self) {
         self.malfunction_detector.reset_halt();
     }
+
+    /// Check drawdown warning level and return graduated warning information.
+    ///
+    /// Returns (warning_level, current_drawdown, max_drawdown, distance_to_limit)
+    /// where warning_level is:
+    /// - 0: Safe (< 80% of limit)
+    /// - 1: Warning (80-90% of limit)
+    /// - 2: Critical (90-95% of limit)
+    /// - 3: Emergency (95-100% of limit)
+    /// - 4: Exceeded (>= 100% of limit)
+    pub fn check_drawdown_warning(&self) -> (u8, Decimal, Decimal, Decimal) {
+        let level = self.drawdown_tracker.warning_level();
+        let current = self.drawdown_tracker.current_drawdown();
+        let max = self.drawdown_tracker.max_drawdown();
+        let distance = max - current;
+        (level, current, max, distance)
+    }
 }
 
 #[cfg(test)]
