@@ -173,6 +173,32 @@ impl BinanceClient {
             .context("Failed to parse futures exchange info")
     }
 
+    /// Get leverage brackets for all symbols (maintenance margin rates).
+    #[instrument(skip(self))]
+    pub async fn get_leverage_brackets(&self) -> Result<Vec<LeverageBracket>> {
+        let timestamp = Self::timestamp();
+        let query = format!("timestamp={}", timestamp);
+        let signature = self.sign(&query);
+
+        let url = format!(
+            "{}/fapi/v1/leverageBracket?{}&signature={}",
+            self.futures_base_url, query, signature
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to fetch leverage brackets")?;
+
+        response
+            .json()
+            .await
+            .context("Failed to parse leverage brackets response")
+    }
+
     // ==================== Account (Authenticated) ====================
 
     /// Get account balance information.

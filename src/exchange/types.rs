@@ -373,3 +373,35 @@ pub struct DeltaNeutralPosition {
     /// Accumulated borrow interest paid
     pub interest_paid: Decimal,
 }
+
+// ==================== Leverage Bracket Types ====================
+
+/// Leverage bracket information for a symbol.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeverageBracket {
+    pub symbol: String,
+    pub brackets: Vec<NotionalBracket>,
+}
+
+/// Notional bracket with maintenance margin rate.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotionalBracket {
+    /// Bracket number (tier)
+    pub bracket: u8,
+    /// Initial leverage for this bracket
+    pub initial_leverage: u8,
+    /// Maximum notional value for this bracket
+    #[serde(with = "rust_decimal::serde::str")]
+    pub notional_cap: Decimal,
+    /// Notional floor for this bracket
+    #[serde(with = "rust_decimal::serde::str")]
+    pub notional_floor: Decimal,
+    /// Maintenance margin rate (e.g., 0.004 = 0.4%)
+    #[serde(with = "rust_decimal::serde::str")]
+    pub maint_margin_ratio: Decimal,
+    /// Cumulative maintenance margin amount
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cum: Decimal,
+}

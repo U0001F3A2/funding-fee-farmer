@@ -251,11 +251,18 @@ impl RiskOrchestrator {
     }
 
     /// Perform comprehensive risk check.
+    ///
+    /// # Arguments
+    /// * `positions` - All current positions
+    /// * `current_equity` - Current account equity
+    /// * `total_margin` - Total margin balance
+    /// * `maintenance_rates` - Map of symbol -> maintenance margin rate from API
     pub fn check_all(
         &mut self,
         positions: &[Position],
         current_equity: Decimal,
         total_margin: Decimal,
+        maintenance_rates: &HashMap<String, Decimal>,
     ) -> RiskCheckResult {
         let mut result = RiskCheckResult::default();
 
@@ -286,7 +293,7 @@ impl RiskOrchestrator {
 
         // 2. Check margin health
         let (worst_health, _position_health) =
-            self.margin_monitor.check_positions(positions, total_margin);
+            self.margin_monitor.check_positions(positions, total_margin, maintenance_rates);
         result.margin_health = worst_health;
 
         match worst_health {
@@ -333,7 +340,7 @@ impl RiskOrchestrator {
         }
 
         // 3. Check liquidation risk
-        let liquidation_actions = self.liquidation_guard.evaluate(positions, total_margin);
+        let liquidation_actions = self.liquidation_guard.evaluate(positions, total_margin, maintenance_rates);
         for action in liquidation_actions {
             let (symbol, severity, message) = match &action {
                 LiquidationAction::ClosePosition { symbol } => (
