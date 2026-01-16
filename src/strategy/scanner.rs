@@ -23,14 +23,22 @@ impl MarketScanner {
     /// Only returns pairs that have spot margin trading enabled for hedging.
     #[instrument(skip(self, client))]
     pub async fn scan(&self, client: &BinanceClient) -> Result<Vec<QualifiedPair>> {
-        // Fetch all required data in parallel
-        let (funding_rates, tickers, book_tickers, spot_info, margin_assets) = tokio::try_join!(
+        // Fetch public data in parallel (required)
+        let (funding_rates, tickers, book_tickers, spot_info) = tokio::try_join!(
             client.get_funding_rates(),
             client.get_24h_tickers(),
             client.get_book_tickers(),
             client.get_spot_exchange_info(),
-            client.get_margin_all_assets(),
         )?;
+
+        // Fetch margin assets separately (requires auth, may fail in read-only mode)
+        let margin_assets = match client.get_margin_all_assets().await {
+            Ok(assets) => assets,
+            Err(e) => {
+                warn!("Failed to fetch margin assets (may need API key): {}. Using empty list.", e);
+                Vec::new()
+            }
+        };
 
         info!(
             funding_count = funding_rates.len(),

@@ -42,8 +42,9 @@ pub struct FuturesSymbolInfo {
 #[serde(rename_all = "camelCase")]
 pub struct FundingRate {
     pub symbol: String,
-    #[serde(with = "rust_decimal::serde::str")]
+    #[serde(rename = "lastFundingRate", with = "rust_decimal::serde::str")]
     pub funding_rate: Decimal,
+    #[serde(rename = "nextFundingTime")]
     pub funding_time: i64,
     #[serde(default, with = "rust_decimal::serde::str_option")]
     pub mark_price: Option<Decimal>,

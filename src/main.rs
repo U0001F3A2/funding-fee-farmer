@@ -299,7 +299,42 @@ async fn main() -> Result<()> {
                         if let Err(e) = mock_client.place_margin_order(&spot_order).await {
                             error!("❌ [EXECUTE] Spot hedge failed: {}", e);
                             metrics.errors_count += 1;
-                            // TODO: Unwind futures position
+
+                            // Unwind the futures position to avoid directional exposure
+                            let unwind_side = match futures_side {
+                                funding_fee_farmer::exchange::OrderSide::Buy => {
+                                    funding_fee_farmer::exchange::OrderSide::Sell
+                                }
+                                funding_fee_farmer::exchange::OrderSide::Sell => {
+                                    funding_fee_farmer::exchange::OrderSide::Buy
+                                }
+                            };
+
+                            let unwind_order = funding_fee_farmer::exchange::NewOrder {
+                                symbol: alloc.symbol.clone(),
+                                side: unwind_side,
+                                position_side: None,
+                                order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                quantity: Some(quantity),
+                                price: None,
+                                time_in_force: None,
+                                reduce_only: Some(true),
+                                new_client_order_id: None,
+                            };
+
+                            if let Err(unwind_err) =
+                                mock_client.place_futures_order(&unwind_order).await
+                            {
+                                error!(
+                                    "❌ [EXECUTE] CRITICAL: Failed to unwind futures position: {}",
+                                    unwind_err
+                                );
+                            } else {
+                                warn!(
+                                    "⚠️  [EXECUTE] Unwound futures for {} due to spot hedge failure",
+                                    alloc.symbol
+                                );
+                            }
                             continue;
                         }
 
@@ -375,7 +410,91 @@ async fn main() -> Result<()> {
                             position.symbol, action
                         );
                         metrics.rebalances_triggered += 1;
-                        // TODO: Execute rebalance in mock mode
+
+                        // Execute rebalance in mock mode
+                        match &action {
+                            funding_fee_farmer::strategy::RebalanceAction::AdjustSpot {
+                                symbol,
+                                side,
+                                quantity,
+                            } => {
+                                let order = funding_fee_farmer::exchange::MarginOrder {
+                                    symbol: symbol.clone(),
+                                    side: *side,
+                                    order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                    quantity: Some(*quantity),
+                                    price: None,
+                                    time_in_force: None,
+                                    is_isolated: Some(false),
+                                    side_effect_type: Some(
+                                        funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                                    ),
+                                };
+
+                                match mock_client.place_margin_order(&order).await {
+                                    Ok(_) => {
+                                        info!(
+                                            "✅ [REBALANCE] Adjusted spot {} {:?} {}",
+                                            symbol, side, quantity
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("❌ [REBALANCE] Spot adjustment failed: {}", e);
+                                        metrics.errors_count += 1;
+                                    }
+                                }
+                            }
+                            funding_fee_farmer::strategy::RebalanceAction::AdjustFutures {
+                                symbol,
+                                side,
+                                quantity,
+                            } => {
+                                let order = funding_fee_farmer::exchange::NewOrder {
+                                    symbol: symbol.clone(),
+                                    side: *side,
+                                    position_side: None,
+                                    order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                    quantity: Some(*quantity),
+                                    price: None,
+                                    time_in_force: None,
+                                    reduce_only: Some(true),
+                                    new_client_order_id: None,
+                                };
+
+                                match mock_client.place_futures_order(&order).await {
+                                    Ok(_) => {
+                                        info!(
+                                            "✅ [REBALANCE] Adjusted futures {} {:?} {}",
+                                            symbol, side, quantity
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("❌ [REBALANCE] Futures adjustment failed: {}", e);
+                                        metrics.errors_count += 1;
+                                    }
+                                }
+                            }
+                            funding_fee_farmer::strategy::RebalanceAction::FlipPosition {
+                                symbol,
+                                new_funding_direction,
+                            } => {
+                                warn!(
+                                    "⚠️  [REBALANCE] Position flip for {} to {:?} requires manual review",
+                                    symbol, new_funding_direction
+                                );
+                                // Flipping is complex - log for now, would need to close both legs
+                                // and re-enter with opposite direction
+                            }
+                            funding_fee_farmer::strategy::RebalanceAction::ClosePosition {
+                                symbol,
+                            } => {
+                                warn!(
+                                    "⚠️  [REBALANCE] Position close for {} requires manual review",
+                                    symbol
+                                );
+                            }
+                            funding_fee_farmer::strategy::RebalanceAction::None => {}
+                        }
                     }
                 }
             }

@@ -1,0 +1,269 @@
+name: Claude Code Implementation
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  implement-improvement:
+    # Run when issue is labeled 'claude-improvement' OR when @claude is mentioned in a comment
+    if: |
+      (github.event_name == 'issues' && github.event.label.name == 'claude-improvement') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Get issue details
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let issue;
+            if (context.eventName === 'issue_comment') {
+              issue = context.payload.issue;
+            } else {
+              issue = context.payload.issue;
+            }
+
+            // Extract issue number safely (numeric only)
+            core.setOutput('number', issue.number);
+            core.setOutput('has_claude_label', issue.labels.some(l => l.name === 'claude-improvement'));
+
+            // Write issue content to files to avoid command injection
+            // This is the safe pattern - we never interpolate these in shell commands
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/issue_title.txt', issue.title || '');
+            fs.writeFileSync('/tmp/issue_body.txt', issue.body || '');
+
+            // If this is a comment trigger, write the comment too
+            if (context.eventName === 'issue_comment') {
+              fs.writeFileSync('/tmp/comment_body.txt', context.payload.comment.body || '');
+            }
+
+      - name: Create branch name
+        id: branch
+        env:
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+        run: |
+          # Create a safe branch name using only the issue number (numeric)
+          BRANCH_NAME="claude/issue-${ISSUE_NUM}"
+          echo "name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Check if branch exists
+        id: check-branch
+        env:
+          BRANCH_NAME: ${{ steps.branch.outputs.name }}
+        run: |
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            git fetch origin "$BRANCH_NAME"
+            git checkout "$BRANCH_NAME"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            git checkout -b "$BRANCH_NAME"
+          fi
+
+      - name: Prepare implementation prompt
+        run: |
+          # Read from files (safe - content never executed as shell)
+          cat > /tmp/implement_prompt.txt << 'PROMPT_HEADER'
+          You are implementing an improvement for a Rust-based funding fee farming bot.
+
+          ## Issue Title
+          PROMPT_HEADER
+
+          # Append title from file (not shell variable)
+          cat /tmp/issue_title.txt >> /tmp/implement_prompt.txt
+          echo "" >> /tmp/implement_prompt.txt
+
+          cat >> /tmp/implement_prompt.txt << 'PROMPT_BODY_HEADER'
+
+          ## Issue Description
+          PROMPT_BODY_HEADER
+
+          # Append body from file
+          cat /tmp/issue_body.txt >> /tmp/implement_prompt.txt
+
+          cat >> /tmp/implement_prompt.txt << 'PROMPT_INSTRUCTIONS'
+
+          ## Instructions
+          1. Read the relevant source files mentioned in the issue
+          2. Understand the current implementation
+          3. Implement the suggested improvement
+          4. Ensure the code compiles with `cargo build`
+          5. Run tests with `cargo test` to verify nothing is broken
+          6. Keep changes minimal and focused on the issue
+
+          ## Guidelines
+          - Follow existing code style and patterns
+          - Add appropriate error handling
+          - Include comments only where logic is non-obvious
+          - Do NOT create new files unless absolutely necessary
+          - Do NOT modify unrelated code
+
+          Please implement this improvement now.
+          PROMPT_INSTRUCTIONS
+
+          # Add comment context if triggered by comment
+          if [ -f /tmp/comment_body.txt ]; then
+            echo "" >> /tmp/implement_prompt.txt
+            echo "## Additional Context from Comment" >> /tmp/implement_prompt.txt
+            cat /tmp/comment_body.txt >> /tmp/implement_prompt.txt
+          fi
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: /tmp/implement_prompt.txt
+          allowed_tools: "Bash,Read,Write,Edit,Glob,Grep"
+          max_turns: 30
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push changes
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+          BRANCH_NAME: ${{ steps.branch.outputs.name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          # Commit message uses only safe numeric issue number
+          git commit -m "fix: implement improvement for issue #${ISSUE_NUM}
+
+          Automated implementation by Claude Code.
+
+          Closes #${ISSUE_NUM}
+
+          Co-Authored-By: Claude <noreply@anthropic.com>"
+
+          git push -u origin "$BRANCH_NAME"
+
+      - name: Create or update Pull Request
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        env:
+          BRANCH_NAME: ${{ steps.branch.outputs.name }}
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            // Read title from file (safe handling)
+            const issueTitle = fs.readFileSync('/tmp/issue_title.txt', 'utf8').trim();
+            const branchName = process.env.BRANCH_NAME;
+            const issueNum = process.env.ISSUE_NUM;
+
+            // Check if PR already exists
+            const existingPRs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branchName}`,
+              state: 'open'
+            });
+
+            if (existingPRs.data.length > 0) {
+              // PR exists, add a comment
+              const pr = existingPRs.data[0];
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: 'Updated with new changes from Claude Code implementation.'
+              });
+              console.log(`Updated existing PR #${pr.number}`);
+            } else {
+              // Create new PR - title is sanitized by GitHub API
+              const prTitle = `[Claude] ${issueTitle.substring(0, 200)}`;
+              const prBody = [
+                '## Automated Implementation',
+                '',
+                `This PR implements the improvement described in #${issueNum}.`,
+                '',
+                '### Changes',
+                'See commits for detailed changes.',
+                '',
+                '### Testing',
+                '- [ ] Code compiles (`cargo build`)',
+                '- [ ] Tests pass (`cargo test`)',
+                '- [ ] Manual review completed',
+                '',
+                '---',
+                `Closes #${issueNum}`,
+                '',
+                '*This PR was automatically created by Claude Code.*'
+              ].join('\n');
+
+              const pr = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: prTitle,
+                body: prBody,
+                head: branchName,
+                base: 'main'
+              });
+
+              // Add labels
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.data.number,
+                labels: ['automated', 'claude-code']
+              });
+
+              console.log(`Created PR #${pr.data.number}`);
+            }
+
+      - name: Comment on issue if no changes
+        if: steps.changes.outputs.has_changes == 'false'
+        env:
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(process.env.ISSUE_NUM),
+              body: [
+                '## Claude Code Analysis',
+                '',
+                'I analyzed this issue but did not make any code changes. This could mean:',
+                '- The issue may need more specific guidance',
+                '- The suggested fix may already be implemented',
+                '- The issue may require architectural decisions',
+                '',
+                'Please provide more details or implement manually.'
+              ].join('\n')
+            });
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/issue_title.txt /tmp/issue_body.txt
+          rm -f /tmp/comment_body.txt /tmp/implement_prompt.txt

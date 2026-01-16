@@ -353,3 +353,101 @@ This system involves significant financial risk. Funding rates can reverse quick
 - Liquidation during extreme volatility
 
 Always start with small position sizes and thoroughly backtest strategies before deploying capital.
+
+---
+
+## CI/CD: Automated Log Analysis & Improvements
+
+The project includes GitHub Actions workflows for automated monitoring and continuous improvement using Claude Code.
+
+### Workflow Overview
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Log Analysis   │────>│  Create Issue    │────>│  Claude Code    │
+│  (every 4 hrs)  │     │  (if problems)   │     │  Implementation │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+        │                        │                        │
+        v                        v                        v
+   SSH to EC2              Label: claude-           Create PR for
+   Collect logs            improvement              human review
+```
+
+### Workflows
+
+| Workflow | Trigger | Purpose |
+|----------|---------|---------|
+| `log-analysis.yml` | Schedule (every 4h) | Collects logs, analyzes with Claude, creates improvement issues |
+| `claude-implement.yml` | Issue labeled `claude-improvement` | Implements suggested fixes, creates PRs |
+
+### Required GitHub Secrets
+
+Configure these in your repository: **Settings → Secrets and variables → Actions**
+
+| Secret | Description | How to Get |
+|--------|-------------|------------|
+| `ANTHROPIC_API_KEY` | Claude API key for analysis | [console.anthropic.com](https://console.anthropic.com) |
+| `EC2_HOST` | EC2 instance public IP | e.g., `43.203.183.140` |
+| `EC2_SSH_KEY` | Private SSH key for EC2 | Contents of `~/.ssh/fff-key.pem` |
+
+### Setup Instructions
+
+1. **Add Anthropic API Key**
+   ```bash
+   # Go to GitHub repo → Settings → Secrets → Actions → New repository secret
+   # Name: ANTHROPIC_API_KEY
+   # Value: sk-ant-api03-...
+   ```
+
+2. **Add EC2 Host**
+   ```bash
+   # Name: EC2_HOST
+   # Value: 43.203.183.140  (your EC2 public IP)
+   ```
+
+3. **Add SSH Key**
+   ```bash
+   # Name: EC2_SSH_KEY
+   # Value: (paste entire contents of ~/.ssh/fff-key.pem including BEGIN/END lines)
+   ```
+
+### Manual Trigger
+
+You can manually trigger log analysis:
+```bash
+gh workflow run log-analysis.yml
+```
+
+Or trigger Claude to implement an existing issue by commenting:
+```
+@claude please implement this
+```
+
+### Issue Labels
+
+| Label | Meaning |
+|-------|---------|
+| `claude-improvement` | Triggers Claude Code to implement |
+| `automated` | Created by automation |
+| `high` / `medium` / `low` | Priority level |
+| `claude-code` | PR created by Claude |
+
+### How It Works
+
+1. **Log Analysis** (scheduled every 4 hours):
+   - SSHs to EC2 instance
+   - Collects last 4 hours of systemd journal logs
+   - Sends to Claude for analysis
+   - Creates GitHub issues for HIGH priority improvements
+
+2. **Claude Implementation** (triggered by label):
+   - Reads issue description
+   - Checks out code on new branch
+   - Uses Claude Code to implement fix
+   - Runs `cargo build` and `cargo test`
+   - Creates PR if changes are made
+
+3. **Human Review**:
+   - Review the PR created by Claude
+   - Check the automated test results
+   - Merge or request changes

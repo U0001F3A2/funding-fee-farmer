@@ -1,0 +1,241 @@
+name: Log Analysis & Improvement Suggestions
+
+on:
+  schedule:
+    # Run every 4 hours
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      hours_to_analyze:
+        description: 'Hours of logs to analyze'
+        required: false
+        default: '4'
+
+jobs:
+  analyze-logs:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/fff-key.pem
+          chmod 600 ~/.ssh/fff-key.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Collect logs from EC2
+        id: collect-logs
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ec2-user
+          HOURS_INPUT: ${{ github.event.inputs.hours_to_analyze }}
+        run: |
+          HOURS="${HOURS_INPUT:-4}"
+
+          # Collect logs from the last N hours
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo journalctl -u funding-fee-farmer --since '${HOURS} hours ago' --no-pager 2>/dev/null | tail -500" \
+            > /tmp/recent_logs.txt
+
+          # Also get current service status
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo systemctl status funding-fee-farmer --no-pager 2>/dev/null | head -20" \
+            > /tmp/service_status.txt
+
+          # Count errors and warnings
+          ERROR_COUNT=$(grep -c "ERROR\|❌" /tmp/recent_logs.txt || echo "0")
+          WARN_COUNT=$(grep -c "WARN\|⚠" /tmp/recent_logs.txt || echo "0")
+
+          echo "error_count=$ERROR_COUNT" >> "$GITHUB_OUTPUT"
+          echo "warn_count=$WARN_COUNT" >> "$GITHUB_OUTPUT"
+          echo "hours=$HOURS" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare analysis prompt
+        id: prepare-prompt
+        run: |
+          # Read logs and escape for JSON
+          SERVICE_STATUS=$(cat /tmp/service_status.txt | head -50)
+          RECENT_LOGS=$(cat /tmp/recent_logs.txt | tail -400)
+
+          # Create the prompt file
+          cat > /tmp/analysis_prompt.txt << 'PROMPT_EOF'
+          Analyze these funding fee farmer bot logs and identify potential improvements.
+
+          ## Service Status
+          PROMPT_EOF
+          echo '```' >> /tmp/analysis_prompt.txt
+          echo "$SERVICE_STATUS" >> /tmp/analysis_prompt.txt
+          echo '```' >> /tmp/analysis_prompt.txt
+
+          cat >> /tmp/analysis_prompt.txt << 'PROMPT_EOF'
+
+          ## Recent Logs
+          PROMPT_EOF
+          echo '```' >> /tmp/analysis_prompt.txt
+          echo "$RECENT_LOGS" >> /tmp/analysis_prompt.txt
+          echo '```' >> /tmp/analysis_prompt.txt
+
+          cat >> /tmp/analysis_prompt.txt << 'PROMPT_EOF'
+
+          Please analyze and provide:
+          1. **Health Assessment**: Is the bot running correctly? Any critical issues?
+          2. **Error Analysis**: What errors occurred and their likely root causes?
+          3. **Performance Observations**: Any patterns in timing, API calls, or resource usage?
+          4. **Improvement Suggestions**: Specific code improvements that could be made
+
+          For each improvement suggestion, rate it:
+          - Priority: HIGH/MEDIUM/LOW
+          - Effort: SMALL/MEDIUM/LARGE
+          - Impact: Brief description of the benefit
+
+          Format your response as JSON with this structure:
+          ```json
+          {
+            "health_status": "healthy|degraded|critical",
+            "summary": "Brief overall summary",
+            "errors": [{"message": "...", "count": 1, "cause": "...", "fix": "..."}],
+            "improvements": [
+              {
+                "title": "Short title for GitHub issue",
+                "description": "Detailed description",
+                "priority": "HIGH|MEDIUM|LOW",
+                "effort": "SMALL|MEDIUM|LARGE",
+                "impact": "What this improves",
+                "files_to_modify": ["src/file.rs"],
+                "suggested_approach": "How to implement this"
+              }
+            ]
+          }
+          ```
+          PROMPT_EOF
+
+      - name: Analyze logs with Claude
+        id: analyze
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: /tmp/analysis_prompt.txt
+          allowed_tools: ""
+          max_turns: 1
+
+      - name: Save analysis result
+        env:
+          ANALYSIS_RESULT: ${{ steps.analyze.outputs.result }}
+        run: |
+          echo "$ANALYSIS_RESULT" > /tmp/analysis_result.txt
+
+      - name: Parse analysis and create issues
+        uses: actions/github-script@v7
+        env:
+          ERROR_COUNT: ${{ steps.collect-logs.outputs.error_count }}
+          WARN_COUNT: ${{ steps.collect-logs.outputs.warn_count }}
+        with:
+          script: |
+            const fs = require('fs');
+            const analysisOutput = fs.readFileSync('/tmp/analysis_result.txt', 'utf8');
+
+            // Try to extract JSON from the response
+            let analysis;
+            try {
+              const jsonMatch = analysisOutput.match(/```json\n?([\s\S]*?)\n?```/);
+              if (jsonMatch) {
+                analysis = JSON.parse(jsonMatch[1]);
+              } else {
+                // Try parsing the whole output as JSON
+                analysis = JSON.parse(analysisOutput);
+              }
+            } catch (e) {
+              console.log('Could not parse JSON from analysis, creating summary issue');
+              const today = new Date().toISOString().split('T')[0];
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[Log Analysis] Review needed - ${today}`,
+                body: `## Automated Log Analysis\n\n**Errors**: ${process.env.ERROR_COUNT}\n**Warnings**: ${process.env.WARN_COUNT}\n\nCould not parse structured analysis. Please review logs manually.`,
+                labels: ['log-analysis', 'needs-review']
+              });
+              return;
+            }
+
+            // Create issues for HIGH priority improvements only
+            const highPriorityImprovements = (analysis.improvements || [])
+              .filter(i => i.priority === 'HIGH');
+
+            for (const improvement of highPriorityImprovements) {
+              // Check if similar issue already exists
+              const existingIssues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'claude-improvement'
+              });
+
+              const titlePrefix = improvement.title.substring(0, 30);
+              const similarExists = existingIssues.data.some(
+                issue => issue.title.includes(titlePrefix)
+              );
+
+              if (!similarExists) {
+                const filesSection = (improvement.files_to_modify || [])
+                  .map(f => `- \`${f}\``)
+                  .join('\n') || '- TBD';
+
+                const body = [
+                  '## Automated Improvement Suggestion',
+                  '',
+                  `**Priority**: ${improvement.priority}`,
+                  `**Effort**: ${improvement.effort}`,
+                  `**Impact**: ${improvement.impact}`,
+                  '',
+                  '### Description',
+                  improvement.description,
+                  '',
+                  '### Files to Modify',
+                  filesSection,
+                  '',
+                  '### Suggested Approach',
+                  improvement.suggested_approach,
+                  '',
+                  '---',
+                  '*This issue was automatically created by log analysis.*',
+                  '',
+                  '@claude please implement this improvement.'
+                ].join('\n');
+
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `[Auto] ${improvement.title}`,
+                  body: body,
+                  labels: ['claude-improvement', 'automated', improvement.priority.toLowerCase()]
+                });
+
+                console.log(`Created issue: ${improvement.title}`);
+              } else {
+                console.log(`Skipping duplicate: ${improvement.title}`);
+              }
+            }
+
+            // Log summary
+            console.log(`Health: ${analysis.health_status}`);
+            console.log(`Summary: ${analysis.summary}`);
+            console.log(`Errors found: ${(analysis.errors || []).length}`);
+            console.log(`Improvements identified: ${(analysis.improvements || []).length}`);
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/fff-key.pem
+          rm -f /tmp/recent_logs.txt /tmp/service_status.txt
+          rm -f /tmp/analysis_prompt.txt /tmp/analysis_result.txt
