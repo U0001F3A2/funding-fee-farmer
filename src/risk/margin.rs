@@ -7,7 +7,7 @@ use rust_decimal_macros::dec;
 use tracing::{debug, warn};
 
 /// Margin health status levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MarginHealth {
     /// Margin ratio > 500% - Safe
     Green,
@@ -170,6 +170,13 @@ mod tests {
             max_drawdown: dec!(0.05),
             min_margin_ratio: dec!(3.0),
             max_single_position: dec!(0.30),
+            max_unprofitable_hours: 48,
+            min_expected_yield: dec!(0.10),
+            grace_period_hours: 8,
+            max_funding_deviation: dec!(0.20),
+            max_errors_per_minute: 10,
+            max_consecutive_failures: 3,
+            emergency_delta_drift: dec!(0.10),
         })
     }
 

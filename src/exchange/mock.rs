@@ -2,6 +2,7 @@
 
 use super::types::*;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -10,8 +11,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-/// Simulated position state.
-#[derive(Debug, Clone, Default)]
+/// Simulated position state with per-position tracking.
+#[derive(Debug, Clone)]
 pub struct MockPosition {
     pub symbol: String,
     pub futures_qty: Decimal,
@@ -19,6 +20,32 @@ pub struct MockPosition {
     pub spot_qty: Decimal,
     pub spot_entry_price: Decimal,
     pub borrowed_amount: Decimal,
+    // Per-position lifecycle tracking
+    /// When the position was opened
+    pub opened_at: DateTime<Utc>,
+    /// Total funding received for this position
+    pub total_funding_received: Decimal,
+    /// Total interest paid for this position (margin borrowing)
+    pub total_interest_paid: Decimal,
+    /// Number of funding collections for this position
+    pub funding_collections: u32,
+}
+
+impl Default for MockPosition {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            futures_qty: Decimal::ZERO,
+            futures_entry_price: Decimal::ZERO,
+            spot_qty: Decimal::ZERO,
+            spot_entry_price: Decimal::ZERO,
+            borrowed_amount: Decimal::ZERO,
+            opened_at: Utc::now(),
+            total_funding_received: Decimal::ZERO,
+            total_interest_paid: Decimal::ZERO,
+            funding_collections: 0,
+        }
+    }
 }
 
 /// Mock trading state for paper trading.
@@ -100,31 +127,46 @@ impl MockBinanceClient {
     }
 
     /// Simulate funding payment collection (call every 8 hours).
-    pub async fn collect_funding(&self) -> Decimal {
+    /// Collect funding payments for all positions.
+    /// Returns a map of symbol -> funding received for verification purposes.
+    pub async fn collect_funding(&self) -> HashMap<String, Decimal> {
         let mut state = self.state.write().await;
         let funding_rates = self.funding_rates.read().await;
         let prices = self.prices.read().await;
 
         let mut total_funding = Decimal::ZERO;
+        let mut per_position_funding: HashMap<String, Decimal> = HashMap::new();
 
-        for (symbol, position) in &state.positions {
-            if let Some(&rate) = funding_rates.get(symbol) {
-                if let Some(&price) = prices.get(symbol) {
-                    // Funding = position_value * funding_rate
-                    // Short futures with positive funding = receive
-                    // Long futures with negative funding = receive
-                    let futures_value = position.futures_qty * price;
-                    let funding = -futures_value * rate; // Negative qty (short) * positive rate = positive funding
+        // Collect symbols first to avoid borrow conflicts
+        let symbols: Vec<String> = state.positions.keys().cloned().collect();
 
-                    total_funding += funding;
+        for symbol in symbols {
+            if let Some(&rate) = funding_rates.get(&symbol) {
+                if let Some(&price) = prices.get(&symbol) {
+                    if let Some(position) = state.positions.get_mut(&symbol) {
+                        // Funding = position_value * funding_rate
+                        // Short futures with positive funding = receive
+                        // Long futures with negative funding = receive
+                        let futures_value = position.futures_qty * price;
+                        let funding = -futures_value * rate; // Negative qty (short) * positive rate = positive funding
 
-                    debug!(
-                        %symbol,
-                        futures_qty = %position.futures_qty,
-                        funding_rate = %rate,
-                        funding_received = %funding,
-                        "Funding payment"
-                    );
+                        total_funding += funding;
+
+                        // Track per-position funding
+                        position.total_funding_received += funding;
+                        position.funding_collections += 1;
+                        per_position_funding.insert(symbol.clone(), funding);
+
+                        debug!(
+                            %symbol,
+                            futures_qty = %position.futures_qty,
+                            funding_rate = %rate,
+                            funding_received = %funding,
+                            position_total_funding = %position.total_funding_received,
+                            funding_collections = position.funding_collections,
+                            "Funding payment"
+                        );
+                    }
                 }
             }
         }
@@ -139,20 +181,26 @@ impl MockBinanceClient {
             "Funding collected"
         );
 
-        total_funding
+        per_position_funding
     }
 
     /// Simulate borrow interest accrual (call periodically).
-    pub async fn accrue_interest(&self, hours: Decimal) {
+    /// Returns a map of symbol -> interest paid for tracking purposes.
+    pub async fn accrue_interest(&self, hours: Decimal) -> HashMap<String, Decimal> {
         let mut state = self.state.write().await;
         let hourly_rate = dec!(0.00002); // ~0.002% per hour (typical Binance rate)
 
         let mut total_interest = Decimal::ZERO;
+        let mut per_position_interest: HashMap<String, Decimal> = HashMap::new();
 
-        for position in state.positions.values() {
+        for (symbol, position) in state.positions.iter_mut() {
             if position.borrowed_amount > Decimal::ZERO {
                 let interest = position.borrowed_amount * hourly_rate * hours;
                 total_interest += interest;
+
+                // Track per-position interest
+                position.total_interest_paid += interest;
+                per_position_interest.insert(symbol.clone(), interest);
             }
         }
 
@@ -166,6 +214,8 @@ impl MockBinanceClient {
                 "Interest accrued"
             );
         }
+
+        per_position_interest
     }
 
     fn next_order_id(&self) -> u64 {
@@ -320,7 +370,7 @@ impl MockBinanceClient {
             .iter()
             .filter(|(_, p)| p.futures_qty != Decimal::ZERO || p.spot_qty != Decimal::ZERO)
             .map(|(symbol, p)| {
-                let price = prices.get(symbol).copied().unwrap_or(dec!(50000));
+                let _price = prices.get(symbol).copied().unwrap_or(dec!(50000));
                 DeltaNeutralPosition {
                     symbol: symbol.clone(),
                     spot_symbol: symbol.clone(),
@@ -331,8 +381,9 @@ impl MockBinanceClient {
                     spot_entry_price: p.spot_entry_price,
                     net_delta: p.futures_qty + p.spot_qty,
                     borrowed_amount: p.borrowed_amount,
-                    funding_pnl: Decimal::ZERO,
-                    interest_paid: Decimal::ZERO,
+                    // Use per-position tracking data
+                    funding_pnl: p.total_funding_received,
+                    interest_paid: p.total_interest_paid,
                 }
             })
             .collect()

@@ -6,7 +6,9 @@ use anyhow::Result;
 use chrono::{DateTime, Timelike, Utc};
 use funding_fee_farmer::config::Config;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
-use funding_fee_farmer::risk::DrawdownTracker;
+use funding_fee_farmer::risk::{
+    RiskOrchestrator, RiskOrchestratorConfig, RiskAlertType, PositionEntry,
+};
 use funding_fee_farmer::strategy::{
     CapitalAllocator, HedgeRebalancer, MarketScanner, OrderExecutor, RebalanceConfig,
 };
@@ -112,7 +114,21 @@ async fn main() -> Result<()> {
     };
 
     let mock_client = MockBinanceClient::new(dec!(10000)); // $10k paper trading
-    let mut drawdown_tracker = DrawdownTracker::new(config.risk.max_drawdown, dec!(10000));
+
+    // Initialize RiskOrchestrator with comprehensive risk monitoring
+    let risk_config = RiskOrchestratorConfig {
+        max_drawdown: config.risk.max_drawdown,
+        min_margin_ratio: config.risk.min_margin_ratio,
+        max_single_position: config.risk.max_single_position,
+        max_unprofitable_hours: config.risk.max_unprofitable_hours,
+        min_expected_yield: config.risk.min_expected_yield,
+        grace_period_hours: config.risk.grace_period_hours,
+        max_funding_deviation: config.risk.max_funding_deviation,
+        max_errors_per_minute: config.risk.max_errors_per_minute,
+        max_consecutive_failures: config.risk.max_consecutive_failures,
+        emergency_delta_drift: config.risk.emergency_delta_drift,
+    };
+    let mut risk_orchestrator = RiskOrchestrator::new(risk_config, dec!(10000));
 
     // Initialize precisions
     match real_client.get_futures_exchange_info().await {
@@ -191,7 +207,25 @@ async fn main() -> Result<()> {
         };
 
         // ═══════════════════════════════════════════════════════════════
-        // PHASE 2: Capital Allocation
+        // PHASE 2: Malfunction Check
+        // ═══════════════════════════════════════════════════════════════
+        if risk_orchestrator.check_malfunctions() {
+            error!("🚨 [RISK] Trading halted due to detected malfunction!");
+            // Log active alerts
+            for alert in risk_orchestrator.get_active_alerts() {
+                error!(
+                    "   Alert: {} - {:?}",
+                    alert.message,
+                    alert.malfunction_type
+                );
+            }
+            // Wait longer before retrying
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            continue;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // PHASE 3: Capital Allocation
         // ═══════════════════════════════════════════════════════════════
         if !qualified_pairs.is_empty() {
             let current_positions: HashMap<String, Decimal> = if trading_mode == TradingMode::Mock {
@@ -228,7 +262,7 @@ async fn main() -> Result<()> {
                 }
 
                 // ═══════════════════════════════════════════════════════════════
-                // PHASE 3: Order Execution (Mock)
+                // PHASE 4: Order Execution (Mock)
                 // ═══════════════════════════════════════════════════════════════
                 if trading_mode == TradingMode::Mock {
                     // Update mock client with real prices
@@ -279,8 +313,11 @@ async fn main() -> Result<()> {
                         if let Err(e) = mock_client.place_futures_order(&futures_order).await {
                             error!("❌ [EXECUTE] Futures order failed: {}", e);
                             metrics.errors_count += 1;
+                            risk_orchestrator.record_error(&format!("Futures order failed: {}", e));
+                            risk_orchestrator.record_order_failure(&alloc.symbol);
                             continue;
                         }
+                        risk_orchestrator.record_order_success(&alloc.symbol);
 
                         // Execute spot hedge
                         let spot_order = funding_fee_farmer::exchange::MarginOrder {
@@ -299,6 +336,8 @@ async fn main() -> Result<()> {
                         if let Err(e) = mock_client.place_margin_order(&spot_order).await {
                             error!("❌ [EXECUTE] Spot hedge failed: {}", e);
                             metrics.errors_count += 1;
+                            risk_orchestrator.record_error(&format!("Spot hedge failed: {}", e));
+                            risk_orchestrator.record_order_failure(&alloc.spot_symbol);
 
                             // Unwind the futures position to avoid directional exposure
                             let unwind_side = match futures_side {
@@ -343,6 +382,17 @@ async fn main() -> Result<()> {
                             alloc.symbol, quantity, price
                         );
                         metrics.positions_entered += 1;
+
+                        // Track position for risk monitoring
+                        let entry = PositionEntry {
+                            symbol: alloc.symbol.clone(),
+                            entry_price: price,
+                            quantity,
+                            position_value: alloc.target_size_usdt,
+                            expected_funding_rate: alloc.funding_rate,
+                            entry_fees: alloc.target_size_usdt * dec!(0.0004), // ~0.04% taker fee
+                        };
+                        risk_orchestrator.open_position(entry);
                     }
                 } else {
                     // LIVE TRADING EXECUTION
@@ -379,7 +429,7 @@ async fn main() -> Result<()> {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // PHASE 4: Hedge Rebalancing
+        // PHASE 5: Hedge Rebalancing
         // ═══════════════════════════════════════════════════════════════
         if trading_mode == TradingMode::Mock {
             let positions = mock_client.get_delta_neutral_positions().await;
@@ -487,10 +537,13 @@ async fn main() -> Result<()> {
                             }
                             funding_fee_farmer::strategy::RebalanceAction::ClosePosition {
                                 symbol,
+                                spot_symbol: _,
+                                futures_qty,
+                                spot_qty,
                             } => {
                                 warn!(
-                                    "⚠️  [REBALANCE] Position close for {} requires manual review",
-                                    symbol
+                                    "⚠️  [REBALANCE] Position close executed for {} (futures: {}, spot: {})",
+                                    symbol, futures_qty, spot_qty
                                 );
                             }
                             funding_fee_farmer::strategy::RebalanceAction::None => {}
@@ -501,7 +554,7 @@ async fn main() -> Result<()> {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // PHASE 5: Funding Collection (simulated every 8 hours)
+        // PHASE 6: Funding Collection & Verification
         // ═══════════════════════════════════════════════════════════════
         let current_hour = Utc::now().hour();
         let is_funding_hour = current_hour == 0 || current_hour == 8 || current_hour == 16;
@@ -509,39 +562,216 @@ async fn main() -> Result<()> {
         if is_funding_hour && last_funding_hour != Some(current_hour) {
             if trading_mode == TradingMode::Mock {
                 info!("💸 [FUNDING] Collecting funding payments...");
-                let funding = mock_client.collect_funding().await;
-                info!("💸 [FUNDING] Received: ${:.4}", funding);
+                let per_position_funding = mock_client.collect_funding().await;
+                let total_funding: Decimal = per_position_funding.values().sum();
+                info!("💸 [FUNDING] Received: ${:.4} across {} positions", total_funding, per_position_funding.len());
                 metrics.funding_collections += 1;
+
+                // Verify funding for each position using actual per-position data
+                for (symbol, actual_funding) in &per_position_funding {
+                    if risk_orchestrator.get_tracked_position(symbol).is_some() {
+                        // Record and verify funding with actual per-position amount
+                        risk_orchestrator.record_funding(symbol, *actual_funding);
+                        let verification = risk_orchestrator.verify_funding(symbol, *actual_funding);
+
+                        if verification.is_anomaly {
+                            warn!(
+                                "⚠️  [FUNDING] Anomaly for {}: expected ${:.4}, got ${:.4} ({:.1}% deviation)",
+                                symbol,
+                                verification.funding_expected,
+                                verification.funding_received,
+                                verification.deviation_pct * dec!(100)
+                            );
+                        }
+                    }
+                }
             }
             last_funding_hour = Some(current_hour);
         }
 
-        // Accrue interest periodly
+        // Accrue interest periodically
         if trading_mode == TradingMode::Mock {
-            mock_client.accrue_interest(dec!(0.0167)).await; // ~1 minute in hours
+            // accrue_interest now returns per-position interest amounts
+            let per_position_interest = mock_client.accrue_interest(dec!(0.0167)).await; // ~1 minute in hours
+
+            // Record actual per-position interest in risk tracker
+            for (symbol, interest) in &per_position_interest {
+                risk_orchestrator.record_interest(symbol, *interest);
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // PHASE 6: Drawdown Check & Status Logging
+        // PHASE 7: Comprehensive Risk Check
         // ═══════════════════════════════════════════════════════════════
         if trading_mode == TradingMode::Mock {
             let state = mock_client.get_state().await;
             let (realized_pnl, unrealized_pnl) = mock_client.calculate_pnl().await;
             let total_equity = state.balance + unrealized_pnl;
 
-            if drawdown_tracker.update(total_equity) {
-                error!("🚨 [RISK] Maximum drawdown exceeded! Halting trading.");
+            // Build position list for risk checks
+            let positions = mock_client.get_delta_neutral_positions().await;
+            let exchange_positions: Vec<funding_fee_farmer::exchange::Position> = positions
+                .iter()
+                .map(|p| funding_fee_farmer::exchange::Position {
+                    symbol: p.symbol.clone(),
+                    position_amt: p.futures_qty,
+                    entry_price: p.futures_entry_price,
+                    unrealized_profit: p.funding_pnl - p.interest_paid, // Net PnL
+                    leverage: 5,
+                    notional: p.futures_entry_price * p.futures_qty.abs(),
+                    isolated_margin: Decimal::ZERO,
+                    mark_price: p.futures_entry_price, // Simplified
+                    liquidation_price: Decimal::ZERO,
+                    position_side: funding_fee_farmer::exchange::PositionSide::Both,
+                    margin_type: funding_fee_farmer::exchange::MarginType::Cross,
+                })
+                .collect();
+
+            // Run comprehensive risk check
+            let risk_result = risk_orchestrator.check_all(&exchange_positions, total_equity, state.balance);
+
+            // Handle risk alerts
+            if !risk_result.alerts.is_empty() {
+                for alert in &risk_result.alerts {
+                    match &alert.alert_type {
+                        RiskAlertType::DrawdownExceeded { current, limit } => {
+                            error!(
+                                "🚨 [RISK] Drawdown {:.2}% exceeds limit {:.2}%!",
+                                current * dec!(100),
+                                limit * dec!(100)
+                            );
+                        }
+                        RiskAlertType::MarginWarning { health, action } => {
+                            warn!("⚠️  [RISK] Margin health: {:?} - {}", health, action);
+                        }
+                        RiskAlertType::PositionLoss { symbol, reason, hours } => {
+                            warn!(
+                                "⚠️  [RISK] Position {} unprofitable: {} ({}h)",
+                                symbol, reason, hours
+                            );
+                        }
+                        RiskAlertType::FundingAnomaly { symbol, deviation } => {
+                            warn!(
+                                "⚠️  [RISK] Funding anomaly {}: {:.1}% deviation",
+                                symbol,
+                                deviation * dec!(100)
+                            );
+                        }
+                        RiskAlertType::Malfunction { malfunction_type } => {
+                            error!("🚨 [RISK] Malfunction detected: {:?}", malfunction_type);
+                        }
+                        RiskAlertType::LiquidationRisk { action } => {
+                            error!("🚨 [RISK] Liquidation risk! Action: {:?}", action);
+                        }
+                        RiskAlertType::DeltaDrift { symbol, drift_pct } => {
+                            warn!(
+                                "⚠️  [RISK] Delta drift on {}: {:.2}%",
+                                symbol,
+                                drift_pct * dec!(100)
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Handle positions to close
+            for symbol in &risk_result.positions_to_close {
+                warn!("🚨 [RISK] Position {} flagged for closure by risk orchestrator", symbol);
+
+                // Find position data for this symbol
+                if let Some(pos) = positions.iter().find(|p| &p.symbol == symbol) {
+                    info!(
+                        "🔄 [RISK] Executing position closure for {} (futures: {}, spot: {})",
+                        symbol, pos.futures_qty, pos.spot_qty
+                    );
+
+                    let mut close_success = true;
+                    let mut close_errors = Vec::new();
+
+                    // Step 1: Close futures leg
+                    if pos.futures_qty != Decimal::ZERO {
+                        let futures_side = if pos.futures_qty > Decimal::ZERO {
+                            funding_fee_farmer::exchange::OrderSide::Sell
+                        } else {
+                            funding_fee_farmer::exchange::OrderSide::Buy
+                        };
+
+                        let futures_order = funding_fee_farmer::exchange::NewOrder {
+                            symbol: pos.symbol.clone(),
+                            side: futures_side,
+                            position_side: None,
+                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                            quantity: Some(pos.futures_qty.abs()),
+                            price: None,
+                            time_in_force: None,
+                            reduce_only: Some(true),
+                            new_client_order_id: None,
+                        };
+
+                        if let Err(e) = mock_client.place_futures_order(&futures_order).await {
+                            close_success = false;
+                            close_errors.push(format!("Futures: {}", e));
+                        }
+                    }
+
+                    // Step 2: Close spot leg
+                    if pos.spot_qty != Decimal::ZERO {
+                        let spot_side = if pos.spot_qty > Decimal::ZERO {
+                            funding_fee_farmer::exchange::OrderSide::Sell
+                        } else {
+                            funding_fee_farmer::exchange::OrderSide::Buy
+                        };
+
+                        let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                            symbol: pos.spot_symbol.clone(),
+                            side: spot_side,
+                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                            quantity: Some(pos.spot_qty.abs()),
+                            price: None,
+                            time_in_force: None,
+                            is_isolated: Some(false),
+                            side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
+                        };
+
+                        if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                            close_success = false;
+                            close_errors.push(format!("Spot: {}", e));
+                        }
+                    }
+
+                    if close_success {
+                        info!("✅ [RISK] Successfully closed position {}", symbol);
+                        risk_orchestrator.close_position(symbol);
+                        metrics.positions_exited += 1;
+                    } else {
+                        error!(
+                            "❌ [RISK] Failed to close position {}: {}",
+                            symbol, close_errors.join("; ")
+                        );
+                        risk_orchestrator.record_error(&format!(
+                            "Position close failed for {}: {}",
+                            symbol, close_errors.join("; ")
+                        ));
+                    }
+                } else {
+                    warn!("⚠️  [RISK] Position {} not found in active positions", symbol);
+                }
+            }
+
+            // Check halt conditions
+            if risk_result.should_halt {
+                error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");
                 break;
             }
 
             // Log status every 5 minutes
             if (Utc::now() - last_status_log).num_minutes() >= 5 {
-                log_status(
+                log_status_with_risk(
                     &metrics,
                     &state,
                     realized_pnl,
                     unrealized_pnl,
-                    &drawdown_tracker,
+                    &risk_orchestrator,
                 );
                 last_status_log = Utc::now();
             }
@@ -553,8 +783,21 @@ async fn main() -> Result<()> {
                     .map(|b| b.wallet_balance + b.unrealized_profit)
                     .sum();
 
-                if drawdown_tracker.update(total_equity) {
-                    error!("🚨 [RISK] Maximum drawdown exceeded! HALTING TRADING.");
+                let margin_balance: Decimal = balances
+                    .iter()
+                    .map(|b| b.wallet_balance)
+                    .sum();
+
+                // Get positions for live mode
+                let live_positions = match real_client.get_positions().await {
+                    Ok(pos) => pos.into_iter().filter(|p| p.position_amt != Decimal::ZERO).collect(),
+                    Err(_) => vec![],
+                };
+
+                let risk_result = risk_orchestrator.check_all(&live_positions, total_equity, margin_balance);
+
+                if risk_result.should_halt {
+                    error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");
                     break;
                 }
             }
@@ -573,12 +816,12 @@ async fn main() -> Result<()> {
     if trading_mode == TradingMode::Mock {
         let state = mock_client.get_state().await;
         let (realized_pnl, unrealized_pnl) = mock_client.calculate_pnl().await;
-        log_status(
+        log_status_with_risk(
             &metrics,
             &state,
             realized_pnl,
             unrealized_pnl,
-            &drawdown_tracker,
+            &risk_orchestrator,
         );
     }
 
@@ -688,17 +931,21 @@ async fn fetch_prices(
     }
 }
 
-/// Log comprehensive status.
-fn log_status(
+/// Log comprehensive status with risk orchestrator metrics.
+fn log_status_with_risk(
     metrics: &AppMetrics,
     state: &funding_fee_farmer::exchange::mock::MockTradingState,
     realized_pnl: Decimal,
     unrealized_pnl: Decimal,
-    drawdown_tracker: &DrawdownTracker,
+    risk_orchestrator: &RiskOrchestrator,
 ) {
     let runtime = Utc::now() - metrics.start_time;
     let hours = runtime.num_hours();
     let minutes = runtime.num_minutes() % 60;
+
+    let drawdown_stats = risk_orchestrator.get_drawdown_stats();
+    let active_alerts = risk_orchestrator.get_active_alerts();
+    let tracked_positions = risk_orchestrator.get_all_tracked_positions();
 
     info!("╔════════════════════════════════════════════════════════════╗");
     info!("║                    STATUS REPORT                           ║");
@@ -777,19 +1024,46 @@ fn log_status(
     info!("║ ⚠️  RISK                                                   ║");
     info!(
         "║    Current Drawdown:   {:>6.2}%                            ",
-        drawdown_tracker.current_drawdown() * dec!(100)
+        drawdown_stats.current_drawdown * dec!(100)
     );
     info!(
         "║    Session MDD:        {:>6.2}%                            ",
-        drawdown_tracker.session_mdd() * dec!(100)
+        drawdown_stats.session_mdd * dec!(100)
     );
     info!(
         "║    Peak Equity:        ${:>12.2}                     ",
-        drawdown_tracker.peak_equity()
+        drawdown_stats.peak_equity
     );
     info!(
         "║    Active Positions:   {:>6}                              ",
         state.positions.len()
     );
+    info!(
+        "║    Tracked Positions:  {:>6}                              ",
+        tracked_positions.len()
+    );
+    info!(
+        "║    Active Alerts:      {:>6}                              ",
+        active_alerts.len()
+    );
     info!("╚════════════════════════════════════════════════════════════╝");
+
+    // Log per-position health if any positions tracked
+    if !tracked_positions.is_empty() {
+        info!("╔════════════════════════════════════════════════════════════╗");
+        info!("║                 POSITION HEALTH                            ║");
+        info!("╠════════════════════════════════════════════════════════════╣");
+        for pos in &tracked_positions {
+            let net_pnl = pos.net_pnl();
+            let status = if net_pnl >= Decimal::ZERO { "✅" } else { "⚠️" };
+            info!(
+                "║ {} {:12} | Fund: ${:>8.4} | Net: ${:>8.4}          ",
+                status,
+                pos.symbol,
+                pos.total_funding_received,
+                net_pnl
+            );
+        }
+        info!("╚════════════════════════════════════════════════════════════╝");
+    }
 }

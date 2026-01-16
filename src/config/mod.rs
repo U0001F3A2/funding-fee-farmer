@@ -56,6 +56,31 @@ pub struct RiskConfig {
     /// Maximum allocation to a single position (0.0-1.0)
     #[serde(default = "default_max_single_position")]
     pub max_single_position: Decimal,
+
+    // Position loss detection
+    /// Maximum hours to keep an unprofitable position
+    #[serde(default = "default_max_unprofitable_hours")]
+    pub max_unprofitable_hours: u32,
+    /// Minimum expected annualized yield (0.0-1.0, e.g., 0.10 = 10%)
+    #[serde(default = "default_min_expected_yield")]
+    pub min_expected_yield: Decimal,
+    /// Grace period hours before profit checking starts
+    #[serde(default = "default_grace_period_hours")]
+    pub grace_period_hours: u32,
+    /// Maximum allowed funding deviation (0.0-1.0)
+    #[serde(default = "default_max_funding_deviation")]
+    pub max_funding_deviation: Decimal,
+
+    // Malfunction detection
+    /// Maximum API errors per minute before alert
+    #[serde(default = "default_max_errors_per_minute")]
+    pub max_errors_per_minute: u32,
+    /// Maximum consecutive order failures before alert
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    /// Delta drift percentage that triggers emergency (0.0-1.0)
+    #[serde(default = "default_emergency_delta_drift")]
+    pub emergency_delta_drift: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +172,36 @@ fn default_order_timeout() -> u64 {
     30
 }
 
+// Position loss detection defaults
+fn default_max_unprofitable_hours() -> u32 {
+    48
+}
+
+fn default_min_expected_yield() -> Decimal {
+    Decimal::new(10, 2) // 0.10 (10% APY)
+}
+
+fn default_grace_period_hours() -> u32 {
+    8
+}
+
+fn default_max_funding_deviation() -> Decimal {
+    Decimal::new(20, 2) // 0.20 (20%)
+}
+
+// Malfunction detection defaults
+fn default_max_errors_per_minute() -> u32 {
+    10
+}
+
+fn default_max_consecutive_failures() -> u32 {
+    3
+}
+
+fn default_emergency_delta_drift() -> Decimal {
+    Decimal::new(10, 2) // 0.10 (10%)
+}
+
 impl Config {
     /// Load configuration from environment variables and config files.
     pub fn load() -> Result<Self> {
@@ -208,6 +263,13 @@ impl Default for Config {
                 max_drawdown: default_max_drawdown(),
                 min_margin_ratio: default_min_margin_ratio(),
                 max_single_position: default_max_single_position(),
+                max_unprofitable_hours: default_max_unprofitable_hours(),
+                min_expected_yield: default_min_expected_yield(),
+                grace_period_hours: default_grace_period_hours(),
+                max_funding_deviation: default_max_funding_deviation(),
+                max_errors_per_minute: default_max_errors_per_minute(),
+                max_consecutive_failures: default_max_consecutive_failures(),
+                emergency_delta_drift: default_emergency_delta_drift(),
             },
             pair_selection: PairSelectionConfig {
                 min_volume_24h: default_min_volume(),

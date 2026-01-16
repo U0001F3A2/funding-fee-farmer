@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use tracing::{error, info, warn};
 
 /// Action to take for a position at risk of liquidation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum LiquidationAction {
     /// No action needed
     None,

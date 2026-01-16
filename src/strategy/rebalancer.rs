@@ -53,7 +53,14 @@ pub enum RebalanceAction {
         new_funding_direction: FundingDirection,
     },
     /// Close position entirely (funding no longer profitable)
-    ClosePosition { symbol: String },
+    ClosePosition {
+        symbol: String,
+        spot_symbol: String,
+        /// Futures quantity (negative = short, positive = long)
+        futures_qty: Decimal,
+        /// Spot quantity (negative = short via margin, positive = long)
+        spot_qty: Decimal,
+    },
 }
 
 /// Direction of funding payments.
@@ -315,18 +322,113 @@ impl HedgeRebalancer {
                 })
             }
 
-            RebalanceAction::ClosePosition { symbol } => {
-                warn!(
+            RebalanceAction::ClosePosition { symbol, spot_symbol, futures_qty, spot_qty } => {
+                info!(
                     %symbol,
-                    "Position close not yet implemented - manual intervention required"
+                    %spot_symbol,
+                    %futures_qty,
+                    %spot_qty,
+                    "Closing delta-neutral position"
                 );
+
+                let mut errors = Vec::new();
+                let mut last_order = None;
+
+                // Step 1: Close futures leg first (reduce exchange liquidation risk)
+                if *futures_qty != Decimal::ZERO {
+                    let futures_side = if *futures_qty > Decimal::ZERO {
+                        OrderSide::Sell // Long futures -> sell to close
+                    } else {
+                        OrderSide::Buy // Short futures -> buy to close
+                    };
+
+                    let futures_order = NewOrder {
+                        symbol: symbol.clone(),
+                        side: futures_side,
+                        position_side: None,
+                        order_type: OrderType::Market,
+                        quantity: Some(futures_qty.abs()),
+                        price: None,
+                        time_in_force: None,
+                        reduce_only: Some(true),
+                        new_client_order_id: None,
+                    };
+
+                    match client.place_futures_order(&futures_order).await {
+                        Ok(response) => {
+                            info!(
+                                %symbol,
+                                side = ?futures_side,
+                                qty = %futures_qty.abs(),
+                                "Closed futures leg"
+                            );
+                            last_order = Some(response);
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to close futures leg: {}", e);
+                            warn!(%symbol, error = %e, "Futures close failed");
+                            errors.push(msg);
+                        }
+                    }
+                }
+
+                // Step 2: Close spot leg (with auto-repay if borrowed)
+                if *spot_qty != Decimal::ZERO {
+                    let spot_side = if *spot_qty > Decimal::ZERO {
+                        OrderSide::Sell // Long spot -> sell to close
+                    } else {
+                        OrderSide::Buy // Short spot (borrowed) -> buy to close and repay
+                    };
+
+                    let spot_order = MarginOrder {
+                        symbol: spot_symbol.clone(),
+                        side: spot_side,
+                        order_type: OrderType::Market,
+                        quantity: Some(spot_qty.abs()),
+                        price: None,
+                        time_in_force: None,
+                        is_isolated: Some(false),
+                        side_effect_type: Some(SideEffectType::AutoBorrowRepay),
+                    };
+
+                    match client.place_margin_order(&spot_order).await {
+                        Ok(response) => {
+                            info!(
+                                %spot_symbol,
+                                side = ?spot_side,
+                                qty = %spot_qty.abs(),
+                                "Closed spot leg"
+                            );
+                            last_order = Some(response);
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to close spot leg: {}", e);
+                            warn!(%spot_symbol, error = %e, "Spot close failed");
+                            errors.push(msg);
+                        }
+                    }
+                }
+
+                let success = errors.is_empty();
+                let error_msg = if errors.is_empty() {
+                    None
+                } else {
+                    Some(errors.join("; "))
+                };
+
+                if success {
+                    info!(%symbol, "Position closed successfully");
+                } else {
+                    warn!(%symbol, errors = ?error_msg, "Position close partially failed");
+                }
+
                 Ok(RebalanceResult {
                     symbol: symbol.clone(),
                     action_taken: action.clone(),
-                    order: None,
+                    order: last_order,
                     new_delta: Decimal::ZERO,
-                    success: false,
-                    error: Some("Position close requires manual intervention".to_string()),
+                    success,
+                    error: error_msg,
                 })
             }
         }
