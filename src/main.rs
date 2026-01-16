@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Timelike, Utc};
 use funding_fee_farmer::config::Config;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
+use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
     RiskOrchestrator, RiskOrchestratorConfig, RiskAlertType, PositionEntry,
 };
@@ -113,7 +114,28 @@ async fn main() -> Result<()> {
         }
     };
 
-    let mock_client = MockBinanceClient::new(dec!(10000)); // $10k paper trading
+    let mock_client = MockBinanceClient::new(dec!(10000)); // $10k paper trading default
+
+    // Initialize SQLite persistence for mock state
+    let persistence = PersistenceManager::new("data/mock_state.db")
+        .expect("Failed to initialize persistence database");
+
+    // Try to restore previous state
+    let initial_balance = if let Ok(Some(persisted_state)) = persistence.load_state() {
+        info!("📂 [PERSISTENCE] Restoring state from database");
+        info!(
+            "   Balance: ${:.2}, Positions: {}, Total Funding: ${:.4}",
+            persisted_state.balance,
+            persisted_state.positions.len(),
+            persisted_state.total_funding_received
+        );
+        let balance = persisted_state.balance;
+        mock_client.restore_state(persisted_state).await;
+        balance
+    } else {
+        info!("📂 [PERSISTENCE] No previous state found, starting fresh with $10,000");
+        dec!(10000)
+    };
 
     // Initialize RiskOrchestrator with comprehensive risk monitoring
     let risk_config = RiskOrchestratorConfig {
@@ -128,7 +150,7 @@ async fn main() -> Result<()> {
         max_consecutive_failures: config.risk.max_consecutive_failures,
         emergency_delta_drift: config.risk.emergency_delta_drift,
     };
-    let mut risk_orchestrator = RiskOrchestrator::new(risk_config, dec!(10000));
+    let mut risk_orchestrator = RiskOrchestrator::new(risk_config, initial_balance);
 
     // Initialize precisions
     match real_client.get_futures_exchange_info().await {
@@ -167,9 +189,10 @@ async fn main() -> Result<()> {
     info!("🚀 Starting main trading loop...");
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Track last funding collection time
+    // Track last funding collection time and state saves
     let mut last_funding_hour: Option<u32> = None;
     let mut last_status_log = Utc::now();
+    let mut last_state_save = Utc::now();
 
     // Main trading loop
     while !shutdown.load(Ordering::SeqCst) {
@@ -586,6 +609,16 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Save state after funding collection (critical checkpoint)
+            if trading_mode == TradingMode::Mock {
+                let state_to_save = mock_client.export_state().await;
+                if let Err(e) = persistence.save_state(&state_to_save) {
+                    warn!("⚠️  [PERSISTENCE] Failed to save state after funding: {}", e);
+                } else {
+                    debug!("💾 [PERSISTENCE] State saved after funding collection");
+                }
+            }
+
             last_funding_hour = Some(current_hour);
         }
 
@@ -803,11 +836,48 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Periodic state save (hourly) for crash recovery
+        if trading_mode == TradingMode::Mock {
+            let now = Utc::now();
+            if (now - last_state_save).num_minutes() >= 60 {
+                let state_to_save = mock_client.export_state().await;
+                if let Err(e) = persistence.save_state(&state_to_save) {
+                    warn!("⚠️  [PERSISTENCE] Failed periodic state save: {}", e);
+                } else {
+                    info!("💾 [PERSISTENCE] Hourly state checkpoint saved");
+                    // Also record equity snapshot for analysis
+                    let (realized_pnl, unrealized_pnl) = mock_client.calculate_pnl().await;
+                    let total_equity = state_to_save.balance + unrealized_pnl;
+                    let max_drawdown = risk_orchestrator.get_drawdown_stats().session_mdd;
+                    let _ = persistence.record_snapshot(
+                        state_to_save.balance,
+                        unrealized_pnl,
+                        total_equity,
+                        realized_pnl,
+                        state_to_save.positions.len(),
+                        max_drawdown,
+                    );
+                }
+                last_state_save = now;
+            }
+        }
+
         // Sleep before next iteration
         let loop_duration = (Utc::now() - loop_start).num_milliseconds();
         debug!("⏱️  Loop completed in {}ms", loop_duration);
 
         tokio::time::sleep(Duration::from_secs(60)).await; // 1 minute between scans
+    }
+
+    // Save final state before shutdown
+    if trading_mode == TradingMode::Mock {
+        info!("💾 [PERSISTENCE] Saving final state before shutdown...");
+        let state_to_save = mock_client.export_state().await;
+        if let Err(e) = persistence.save_state(&state_to_save) {
+            error!("❌ [PERSISTENCE] Failed to save final state: {}", e);
+        } else {
+            info!("✅ [PERSISTENCE] Final state saved successfully");
+        }
     }
 
     // Final status log

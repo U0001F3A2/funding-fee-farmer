@@ -1,6 +1,7 @@
 //! Mock trading client for paper trading / backtesting.
 
 use super::types::*;
+use crate::persistence::{PersistedPosition, PersistedState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -409,6 +410,89 @@ impl MockBinanceClient {
         let realized_pnl = state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
 
         (realized_pnl, unrealized_pnl)
+    }
+
+    /// Export current state for persistence.
+    pub async fn export_state(&self) -> PersistedState {
+        let state = self.state.read().await;
+
+        let positions = state
+            .positions
+            .iter()
+            .map(|(symbol, pos)| {
+                (
+                    symbol.clone(),
+                    PersistedPosition {
+                        symbol: symbol.clone(),
+                        futures_qty: pos.futures_qty,
+                        futures_entry_price: pos.futures_entry_price,
+                        spot_qty: pos.spot_qty,
+                        spot_entry_price: pos.spot_entry_price,
+                        borrowed_amount: pos.borrowed_amount,
+                        opened_at: pos.opened_at,
+                        total_funding_received: pos.total_funding_received,
+                        total_interest_paid: pos.total_interest_paid,
+                        funding_collections: pos.funding_collections,
+                    },
+                )
+            })
+            .collect();
+
+        PersistedState {
+            initial_balance: state.initial_balance,
+            balance: state.balance,
+            total_funding_received: state.total_funding_received,
+            total_trading_fees: state.total_trading_fees,
+            total_borrow_interest: state.total_borrow_interest,
+            order_count: state.order_count,
+            positions,
+            last_saved: Utc::now(),
+        }
+    }
+
+    /// Restore state from persistence.
+    pub async fn restore_state(&self, persisted: PersistedState) {
+        let mut state = self.state.write().await;
+
+        state.initial_balance = persisted.initial_balance;
+        state.balance = persisted.balance;
+        state.total_funding_received = persisted.total_funding_received;
+        state.total_trading_fees = persisted.total_trading_fees;
+        state.total_borrow_interest = persisted.total_borrow_interest;
+        state.order_count = persisted.order_count;
+
+        state.positions = persisted
+            .positions
+            .into_iter()
+            .map(|(symbol, pos)| {
+                (
+                    symbol,
+                    MockPosition {
+                        symbol: pos.symbol,
+                        futures_qty: pos.futures_qty,
+                        futures_entry_price: pos.futures_entry_price,
+                        spot_qty: pos.spot_qty,
+                        spot_entry_price: pos.spot_entry_price,
+                        borrowed_amount: pos.borrowed_amount,
+                        opened_at: pos.opened_at,
+                        total_funding_received: pos.total_funding_received,
+                        total_interest_paid: pos.total_interest_paid,
+                        funding_collections: pos.funding_collections,
+                    },
+                )
+            })
+            .collect();
+
+        // Update order counter to be higher than persisted count
+        self.order_id_counter
+            .store(persisted.order_count + 1, Ordering::SeqCst);
+
+        info!(
+            balance = %state.balance,
+            positions = state.positions.len(),
+            order_count = state.order_count,
+            "Mock client state restored from persistence"
+        );
     }
 }
 

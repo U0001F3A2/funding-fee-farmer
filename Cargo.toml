@@ -50,6 +50,9 @@ hex = "0.4"
 # URL encoding
 urlencoding = "2.1"
 
+# SQLite persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.13"
