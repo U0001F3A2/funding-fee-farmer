@@ -263,6 +263,11 @@ impl MarketScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::{FundingRate, MarginAsset, SpotSymbolInfo};
+
+    // =========================================================================
+    // Test Helpers
+    // =========================================================================
 
     fn test_config() -> PairSelectionConfig {
         PairSelectionConfig {
@@ -274,10 +279,426 @@ mod tests {
         }
     }
 
+    fn make_funding_rate(symbol: &str, rate: Decimal) -> FundingRate {
+        FundingRate {
+            symbol: symbol.to_string(),
+            funding_rate: rate,
+            funding_time: 0,
+            mark_price: Some(dec!(50000)),
+        }
+    }
+
+    fn make_spot_info(symbol: &str, margin_allowed: bool) -> SpotSymbolInfo {
+        SpotSymbolInfo {
+            symbol: symbol.to_string(),
+            base_asset: symbol.strip_suffix("USDT").unwrap_or("BTC").to_string(),
+            quote_asset: "USDT".to_string(),
+            status: "TRADING".to_string(),
+            is_margin_trading_allowed: margin_allowed,
+        }
+    }
+
+    fn make_margin_asset(asset: &str, daily_rate: Decimal) -> MarginAsset {
+        MarginAsset {
+            asset: asset.to_string(),
+            borrowable: true,
+            collateral: true,
+            margin_interest_rate: Some(daily_rate),
+        }
+    }
+
+    fn setup_test_data() -> (
+        HashMap<String, Decimal>,       // volume_map
+        HashMap<String, Decimal>,       // spread_map
+        HashMap<String, SpotSymbolInfo>, // spot_margin_map (owned)
+        HashMap<String, MarginAsset>,    // margin_asset_map (owned)
+    ) {
+        let mut volume_map = HashMap::new();
+        volume_map.insert("BTCUSDT".to_string(), dec!(1_000_000_000));
+        volume_map.insert("ETHUSDT".to_string(), dec!(500_000_000));
+        volume_map.insert("LOWVOLUSDT".to_string(), dec!(10_000_000)); // Below threshold
+
+        let mut spread_map = HashMap::new();
+        spread_map.insert("BTCUSDT".to_string(), dec!(0.00005)); // Very tight
+        spread_map.insert("ETHUSDT".to_string(), dec!(0.0001));  // Acceptable
+        spread_map.insert("WIDESPREADUSDT".to_string(), dec!(0.001)); // Too wide
+
+        let mut spot_map = HashMap::new();
+        spot_map.insert("BTCUSDT".to_string(), make_spot_info("BTCUSDT", true));
+        spot_map.insert("ETHUSDT".to_string(), make_spot_info("ETHUSDT", true));
+        spot_map.insert("NOMARGINUSDT".to_string(), make_spot_info("NOMARGINUSDT", false));
+
+        let mut margin_map = HashMap::new();
+        margin_map.insert("BTC".to_string(), make_margin_asset("BTC", dec!(0.001)));
+        margin_map.insert("ETH".to_string(), make_margin_asset("ETH", dec!(0.002)));
+
+        (volume_map, spread_map, spot_map, margin_map)
+    }
+
+    // =========================================================================
+    // Basic Tests
+    // =========================================================================
+
     #[test]
     fn test_funding_time_calculation() {
         let seconds = MarketScanner::seconds_until_funding();
         assert!(seconds > 0);
         assert!(seconds <= 8 * 3600); // Max 8 hours
+    }
+
+    #[test]
+    fn test_next_funding_time_is_future() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let next_ms = MarketScanner::next_funding_time();
+        assert!(next_ms > now_ms);
+    }
+
+    // =========================================================================
+    // Volume Filter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_min_volume_filter_rejects_low_volume() {
+        let scanner = MarketScanner::new(test_config());
+        let (mut volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Set volume below threshold
+        volume_map.insert("BTCUSDT".to_string(), dec!(10_000_000));
+
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        // Convert to reference maps
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject pair with volume below threshold");
+    }
+
+    #[test]
+    fn test_min_volume_filter_accepts_high_volume() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_some(), "Should accept pair with sufficient volume");
+    }
+
+    // =========================================================================
+    // Funding Rate Filter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_min_funding_rate_filter_rejects_low_rate() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Very small funding rate
+        let funding = make_funding_rate("BTCUSDT", dec!(0.00001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject pair with funding rate below threshold");
+    }
+
+    #[test]
+    fn test_min_funding_rate_accepts_negative_rate() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Negative but large magnitude
+        let funding = make_funding_rate("BTCUSDT", dec!(-0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_some(), "Should accept negative funding rate with sufficient magnitude");
+    }
+
+    // =========================================================================
+    // Spread Filter Tests
+    // =========================================================================
+
+    #[test]
+    fn test_max_spread_filter_rejects_wide_spread() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, mut spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Wide spread
+        spread_map.insert("BTCUSDT".to_string(), dec!(0.001));
+
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject pair with spread above threshold");
+    }
+
+    #[test]
+    fn test_spread_calculation_accuracy() {
+        // Test spread = (ask - bid) / mid
+        let bid = dec!(49990);
+        let ask = dec!(50010);
+        let mid = (bid + ask) / dec!(2); // 50000
+        let spread = (ask - bid) / mid;  // 20 / 50000 = 0.0004
+
+        assert_eq!(spread, dec!(0.0004));
+    }
+
+    // =========================================================================
+    // Borrow Cost Tests
+    // =========================================================================
+
+    #[test]
+    fn test_borrow_cost_calculation_for_negative_funding() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Negative funding rate means we need to short spot (borrow)
+        let funding = make_funding_rate("BTCUSDT", dec!(-0.005));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+
+        // BTC daily borrow rate = 0.001
+        // 8-hour rate = 0.001 / 3 = 0.000333...
+        // Net = 0.005 - 0.000333... = ~0.00467
+        assert!(result.is_some());
+        let pair = result.unwrap();
+        assert_eq!(pair.funding_rate, dec!(-0.005));
+        assert_eq!(pair.borrow_rate, Some(dec!(0.001)));
+    }
+
+    #[test]
+    fn test_no_borrow_cost_for_positive_funding() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Positive funding = short perp, long spot (no borrow needed)
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+
+        // Should qualify - no borrow cost subtracted
+        assert!(result.is_some());
+    }
+
+    // =========================================================================
+    // Scoring Tests
+    // =========================================================================
+
+    #[test]
+    fn test_score_weighting_formula() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let pair = result.unwrap();
+
+        // Verify score is reasonable
+        assert!(pair.score > Decimal::ZERO);
+
+        // Score formula:
+        // funding_score = 0.001 * 10000 * 0.5 = 5
+        // volume_score = min(1B/1B, 1) * 0.25 = 0.25
+        // spread_score = 1/(0.00005*10000+1) * 0.2 = 1/1.5 * 0.2 = ~0.133
+        // margin_safety = 1 * 0.05 = 0.05
+        // Total ~= 5.43
+        assert!(pair.score > dec!(5));
+    }
+
+    #[test]
+    fn test_ranking_by_net_yield() {
+        let scanner = MarketScanner::new(test_config());
+        let (mut volume_map, mut spread_map, mut spot_map, margin_map) = setup_test_data();
+
+        // Add test data for SOLUSDT
+        volume_map.insert("SOLUSDT".to_string(), dec!(500_000_000));
+        spread_map.insert("SOLUSDT".to_string(), dec!(0.0001));
+        spot_map.insert("SOLUSDT".to_string(), make_spot_info("SOLUSDT", true));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        // Create funding rates with different magnitudes
+        let btc_funding = make_funding_rate("BTCUSDT", dec!(0.002)); // Higher
+        let eth_funding = make_funding_rate("ETHUSDT", dec!(0.001)); // Lower
+
+        let btc_pair = scanner.qualify_pair(&btc_funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let eth_pair = scanner.qualify_pair(&eth_funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+
+        assert!(btc_pair.is_some());
+        assert!(eth_pair.is_some());
+
+        // Higher funding rate should have higher score
+        assert!(btc_pair.unwrap().score > eth_pair.unwrap().score);
+    }
+
+    // =========================================================================
+    // Margin Availability Tests
+    // =========================================================================
+
+    #[test]
+    fn test_rejects_pair_without_margin_trading() {
+        let scanner = MarketScanner::new(test_config());
+        let (mut volume_map, mut spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Add data for NOMARGIN pair
+        volume_map.insert("NOMARGINUSDT".to_string(), dec!(100_000_000));
+        spread_map.insert("NOMARGINUSDT".to_string(), dec!(0.0001));
+
+        let funding = make_funding_rate("NOMARGINUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject pair without margin trading");
+    }
+
+    // =========================================================================
+    // Symbol Validation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_rejects_non_usdt_pair() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        let funding = make_funding_rate("BTCBUSD", dec!(0.001)); // Not USDT
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject non-USDT pairs");
+    }
+
+    #[test]
+    fn test_extracts_base_asset_correctly() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let pair = result.unwrap();
+
+        assert_eq!(pair.base_asset, "BTC");
+        assert_eq!(pair.spot_symbol, "BTCUSDT");
+    }
+
+    // =========================================================================
+    // Edge Case Tests
+    // =========================================================================
+
+    #[test]
+    fn test_missing_volume_data() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Missing volume data for NEWUSDT
+        let funding = make_funding_rate("NEWUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject pair with missing volume data");
+    }
+
+    #[test]
+    fn test_missing_spread_data() {
+        let scanner = MarketScanner::new(test_config());
+        let (mut volume_map, spread_map, mut spot_map, margin_map) = setup_test_data();
+
+        // Add volume and spot but no spread
+        volume_map.insert("NEWUSDT".to_string(), dec!(100_000_000));
+        spot_map.insert("NEWUSDT".to_string(), make_spot_info("NEWUSDT", true));
+
+        let funding = make_funding_rate("NEWUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(result.is_none(), "Should reject pair with missing spread data");
+    }
+
+    #[test]
+    fn test_qualified_pair_fields_populated() {
+        let scanner = MarketScanner::new(test_config());
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        let funding = make_funding_rate("BTCUSDT", dec!(0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let pair = result.unwrap();
+
+        assert_eq!(pair.symbol, "BTCUSDT");
+        assert_eq!(pair.spot_symbol, "BTCUSDT");
+        assert_eq!(pair.base_asset, "BTC");
+        assert_eq!(pair.funding_rate, dec!(0.001));
+        assert_eq!(pair.volume_24h, dec!(1_000_000_000));
+        assert_eq!(pair.spread, dec!(0.00005));
+        assert!(pair.margin_available);
+        assert!(pair.borrow_rate.is_some());
+        assert!(pair.score > Decimal::ZERO);
     }
 }

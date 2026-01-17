@@ -447,6 +447,11 @@ impl<D: DataLoader> BacktestEngine<D> {
 mod tests {
     use super::*;
     use crate::backtest::data::{CsvDataLoader, SymbolData};
+    use chrono::TimeZone;
+
+    // =========================================================================
+    // Test Helpers
+    // =========================================================================
 
     fn test_config() -> Config {
         Config::default()
@@ -462,6 +467,35 @@ mod tests {
         }
     }
 
+    fn make_snapshot(
+        timestamp: DateTime<Utc>,
+        symbols: Vec<(&str, Decimal, Decimal)>,
+    ) -> MarketSnapshot {
+        MarketSnapshot {
+            timestamp,
+            symbols: symbols
+                .into_iter()
+                .map(|(sym, rate, price)| SymbolData {
+                    symbol: sym.to_string(),
+                    funding_rate: rate,
+                    price,
+                    volume_24h: dec!(1_500_000_000),
+                    spread: dec!(0.0001),
+                    open_interest: dec!(800_000_000),
+                })
+                .collect(),
+        }
+    }
+
+    fn make_funding_time() -> DateTime<Utc> {
+        // Funding times are 00:00, 08:00, 16:00 UTC
+        Utc.with_ymd_and_hms(2024, 1, 1, 8, 0, 0).unwrap()
+    }
+
+    // =========================================================================
+    // Engine Creation Tests
+    // =========================================================================
+
     #[tokio::test]
     async fn test_engine_creation() {
         let snapshots = vec![MarketSnapshot::new(Utc::now())];
@@ -473,21 +507,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_funding_time_processing() {
-        use chrono::TimeZone;
+    async fn test_engine_initial_state() {
+        let snapshots = vec![MarketSnapshot::new(Utc::now())];
+        let loader = CsvDataLoader::from_snapshots(snapshots);
 
-        let timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 8, 0, 0).unwrap();
-        let snapshots = vec![MarketSnapshot {
-            timestamp,
-            symbols: vec![SymbolData {
-                symbol: "BTCUSDT".to_string(),
-                funding_rate: dec!(0.0001),
-                price: dec!(42000),
-                volume_24h: dec!(1_500_000_000),
-                spread: dec!(0.0001),
-                open_interest: dec!(800_000_000),
-            }],
-        }];
+        let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        assert!(engine.equity_curve.is_empty());
+        assert_eq!(engine.total_funding, Decimal::ZERO);
+        assert_eq!(engine.funding_events, 0);
+        assert_eq!(engine.positions_opened, 0);
+        assert_eq!(engine.positions_closed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_engine_with_custom_balance() {
+        let config = BacktestConfig {
+            initial_balance: dec!(50000),
+            ..test_backtest_config()
+        };
+
+        let snapshots = vec![MarketSnapshot::new(Utc::now())];
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+
+        let engine = BacktestEngine::new(loader, test_config(), config);
+
+        assert_eq!(engine.peak_equity, dec!(50000));
+    }
+
+    // =========================================================================
+    // Funding Processing Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_funding_time_processing() {
+        let timestamp = make_funding_time();
+        let snapshots = vec![make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0001), dec!(42000))])];
 
         let loader = CsvDataLoader::from_snapshots(snapshots);
         let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
@@ -502,5 +557,372 @@ mod tests {
         // No positions yet, so funding should be 0
         assert_eq!(funding, Decimal::ZERO);
         assert_eq!(engine.funding_events, 1);
+    }
+
+    #[tokio::test]
+    async fn test_funding_accumulates() {
+        let timestamp = make_funding_time();
+        let snapshots = vec![make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0001), dec!(42000))])];
+
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        engine.next_funding = timestamp;
+        engine.current_time = timestamp;
+
+        // Process multiple funding events
+        engine.process_funding().await.unwrap();
+        engine.process_funding().await.unwrap();
+        engine.process_funding().await.unwrap();
+
+        assert_eq!(engine.funding_events, 3);
+    }
+
+    // =========================================================================
+    // Snapshot to Qualified Pairs Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_snapshot_to_qualified_pairs_filters() {
+        let timestamp = Utc::now();
+        let snapshot = MarketSnapshot {
+            timestamp,
+            symbols: vec![
+                // High volume, good funding - should qualify
+                SymbolData {
+                    symbol: "BTCUSDT".to_string(),
+                    funding_rate: dec!(0.0005),
+                    price: dec!(50000),
+                    volume_24h: dec!(2_000_000_000),
+                    spread: dec!(0.0001),
+                    open_interest: dec!(1_000_000_000),
+                },
+                // Low volume - should NOT qualify
+                SymbolData {
+                    symbol: "LOWUSDT".to_string(),
+                    funding_rate: dec!(0.001),
+                    price: dec!(100),
+                    volume_24h: dec!(10_000_000), // Below threshold
+                    spread: dec!(0.0001),
+                    open_interest: dec!(500_000_000),
+                },
+                // Low funding - should NOT qualify
+                SymbolData {
+                    symbol: "LOWFUNDUSDT".to_string(),
+                    funding_rate: dec!(0.00001), // Below threshold
+                    price: dec!(100),
+                    volume_24h: dec!(500_000_000),
+                    spread: dec!(0.0001),
+                    open_interest: dec!(500_000_000),
+                },
+            ],
+        };
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
+        let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let pairs = engine.snapshot_to_qualified_pairs(&snapshot);
+
+        // Only BTCUSDT should qualify
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].symbol, "BTCUSDT");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_to_qualified_pairs_score() {
+        let timestamp = Utc::now();
+        let snapshot = MarketSnapshot {
+            timestamp,
+            symbols: vec![
+                SymbolData {
+                    symbol: "BTCUSDT".to_string(),
+                    funding_rate: dec!(0.001), // High funding
+                    price: dec!(50000),
+                    volume_24h: dec!(2_000_000_000),
+                    spread: dec!(0.0001),
+                    open_interest: dec!(1_000_000_000),
+                },
+                SymbolData {
+                    symbol: "ETHUSDT".to_string(),
+                    funding_rate: dec!(0.0005), // Lower funding
+                    price: dec!(3000),
+                    volume_24h: dec!(1_000_000_000),
+                    spread: dec!(0.0001),
+                    open_interest: dec!(500_000_000),
+                },
+            ],
+        };
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
+        let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let pairs = engine.snapshot_to_qualified_pairs(&snapshot);
+
+        // BTC should have higher score (higher funding rate)
+        let btc = pairs.iter().find(|p| p.symbol == "BTCUSDT").unwrap();
+        let eth = pairs.iter().find(|p| p.symbol == "ETHUSDT").unwrap();
+        assert!(btc.score > eth.score);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_to_qualified_pairs_base_asset() {
+        let timestamp = Utc::now();
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
+        let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let pairs = engine.snapshot_to_qualified_pairs(&snapshot);
+
+        assert_eq!(pairs[0].base_asset, "BTC");
+    }
+
+    // =========================================================================
+    // Step Result Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_step_updates_equity() {
+        let timestamp = Utc::now();
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        engine.current_time = timestamp;
+        engine.next_funding = timestamp + Duration::hours(8); // Don't trigger funding
+
+        let result = engine.step(&snapshot).await.unwrap();
+
+        assert_eq!(result.timestamp, timestamp);
+        assert!(result.balance > Decimal::ZERO);
+        // The step may open positions if qualifying pairs are found
+        // Just verify the result is valid
+        assert!(result.total_equity > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_step_at_funding_time() {
+        let timestamp = make_funding_time();
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        engine.current_time = timestamp;
+        engine.next_funding = timestamp; // Trigger funding
+
+        let result = engine.step(&snapshot).await.unwrap();
+
+        // Funding should have been processed
+        assert_eq!(engine.funding_events, 1);
+        // No positions, so funding collected should be 0
+        assert_eq!(result.funding_collected, Decimal::ZERO);
+    }
+
+    // =========================================================================
+    // Equity Curve Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_equity_curve_accessor() {
+        let snapshots = vec![MarketSnapshot::new(Utc::now())];
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+
+        let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        // Initially empty
+        assert!(engine.equity_curve().is_empty());
+    }
+
+    // =========================================================================
+    // Get State Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_state() {
+        let snapshots = vec![MarketSnapshot::new(Utc::now())];
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+
+        let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let state = engine.get_state().await;
+
+        assert_eq!(state.balance, dec!(10000));
+        assert!(state.positions.is_empty());
+    }
+
+    // =========================================================================
+    // Run Backtest Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_run_with_empty_data() {
+        let loader = CsvDataLoader::from_snapshots(vec![]);
+
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let start = Utc::now() - Duration::days(1);
+        let end = Utc::now();
+
+        let result = engine.run(start, end).await;
+
+        // Should error with no data
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_run_with_single_snapshot() {
+        let timestamp = Utc::now();
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot]);
+
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let start = timestamp - Duration::hours(1);
+        let end = timestamp + Duration::hours(1);
+
+        let result = engine.run(start, end).await.unwrap();
+
+        assert_eq!(result.snapshots_processed, 1);
+        assert_eq!(result.start_time, start);
+        assert_eq!(result.end_time, end);
+    }
+
+    #[tokio::test]
+    async fn test_run_with_multiple_snapshots() {
+        let base_time = Utc::now();
+        let snapshots = vec![
+            make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]),
+            make_snapshot(base_time + Duration::hours(1), vec![("BTCUSDT", dec!(0.0006), dec!(50100))]),
+            make_snapshot(base_time + Duration::hours(2), vec![("BTCUSDT", dec!(0.0004), dec!(49900))]),
+        ];
+
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let start = base_time - Duration::hours(1);
+        let end = base_time + Duration::hours(3);
+
+        let result = engine.run(start, end).await.unwrap();
+
+        assert_eq!(result.snapshots_processed, 3);
+        assert!(!result.equity_curve.is_empty());
+    }
+
+    // =========================================================================
+    // BacktestResult Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_backtest_result_summary() {
+        let base_time = Utc::now();
+        let snapshot = make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot]);
+
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let start = base_time - Duration::hours(1);
+        let end = base_time + Duration::hours(1);
+
+        let result = engine.run(start, end).await.unwrap();
+
+        let summary = result.summary();
+
+        assert!(summary.contains("Backtest Period"));
+        assert!(summary.contains("Snapshots: 1"));
+    }
+
+    // =========================================================================
+    // StepResult Structure Tests
+    // =========================================================================
+
+    #[test]
+    fn test_step_result_structure() {
+        let result = StepResult {
+            timestamp: Utc::now(),
+            balance: dec!(10000),
+            unrealized_pnl: dec!(100),
+            total_equity: dec!(10100),
+            position_count: 2,
+            funding_collected: dec!(5),
+        };
+
+        assert_eq!(result.balance, dec!(10000));
+        assert_eq!(result.unrealized_pnl, dec!(100));
+        assert_eq!(result.total_equity, dec!(10100));
+        assert_eq!(result.position_count, 2);
+        assert_eq!(result.funding_collected, dec!(5));
+    }
+
+    // =========================================================================
+    // Peak Equity Tracking Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_peak_equity_updates() {
+        let base_time = Utc::now();
+        let snapshots = vec![
+            make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]),
+            make_snapshot(base_time + Duration::hours(1), vec![("BTCUSDT", dec!(0.0005), dec!(50500))]),
+            make_snapshot(base_time + Duration::hours(2), vec![("BTCUSDT", dec!(0.0005), dec!(50200))]),
+        ];
+
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+
+        let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
+
+        let start = base_time - Duration::hours(1);
+        let end = base_time + Duration::hours(3);
+
+        let _result = engine.run(start, end).await.unwrap();
+
+        // Peak should have been updated
+        assert!(engine.peak_equity >= dec!(10000));
+    }
+
+    // =========================================================================
+    // Configuration Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_backtest_config_time_step() {
+        let config = BacktestConfig {
+            time_step_minutes: 30, // 30 minute steps
+            ..test_backtest_config()
+        };
+
+        let snapshots = vec![MarketSnapshot::new(Utc::now())];
+        let loader = CsvDataLoader::from_snapshots(snapshots);
+
+        let engine = BacktestEngine::new(loader, test_config(), config);
+
+        assert_eq!(engine.backtest_config.time_step_minutes, 30);
+    }
+
+    #[tokio::test]
+    async fn test_backtest_config_no_equity_curve() {
+        let config = BacktestConfig {
+            record_equity_curve: false,
+            ..test_backtest_config()
+        };
+
+        let base_time = Utc::now();
+        let snapshot = make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+
+        let loader = CsvDataLoader::from_snapshots(vec![snapshot]);
+
+        let mut engine = BacktestEngine::new(loader, test_config(), config);
+
+        let start = base_time - Duration::hours(1);
+        let end = base_time + Duration::hours(1);
+
+        let result = engine.run(start, end).await.unwrap();
+
+        // Equity curve should be empty when not recording
+        assert!(result.equity_curve.is_empty());
     }
 }

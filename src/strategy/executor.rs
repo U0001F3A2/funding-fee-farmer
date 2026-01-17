@@ -390,6 +390,10 @@ impl OrderExecutor {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Test Helpers
+    // =========================================================================
+
     fn test_executor() -> OrderExecutor {
         OrderExecutor::new(ExecutionConfig {
             default_leverage: 5,
@@ -399,14 +403,276 @@ mod tests {
         })
     }
 
+    fn test_allocation(symbol: &str, funding_rate: Decimal, size: Decimal) -> PositionAllocation {
+        PositionAllocation {
+            symbol: symbol.to_string(),
+            spot_symbol: symbol.to_string(),
+            base_asset: symbol.strip_suffix("USDT").unwrap_or(symbol).to_string(),
+            target_size_usdt: size,
+            leverage: 5,
+            funding_rate,
+            priority: 1,
+        }
+    }
+
+    // =========================================================================
+    // Slippage Tests
+    // =========================================================================
+
     #[test]
-    fn test_slippage_check() {
+    fn test_slippage_check_passes_within_tolerance() {
         let executor = test_executor();
 
-        // 0.03% slippage - should pass
+        // 0.03% slippage - should pass (tolerance is 0.05%)
         assert!(executor.check_slippage(dec!(50000), dec!(50015)));
+    }
+
+    #[test]
+    fn test_slippage_check_fails_above_tolerance() {
+        let executor = test_executor();
 
         // 0.1% slippage - should fail
         assert!(!executor.check_slippage(dec!(50000), dec!(50050)));
+    }
+
+    #[test]
+    fn test_slippage_check_negative_slippage() {
+        let executor = test_executor();
+
+        // Negative slippage (price dropped) - still checks absolute value
+        // 0.02% below expected - should pass
+        assert!(executor.check_slippage(dec!(50000), dec!(49990)));
+    }
+
+    #[test]
+    fn test_slippage_check_exact_tolerance() {
+        let executor = test_executor();
+
+        // Exactly at tolerance (0.05%)
+        let tolerance_price = dec!(50000) * (dec!(1) + dec!(0.0005));
+        assert!(executor.check_slippage(dec!(50000), tolerance_price));
+    }
+
+    #[test]
+    fn test_slippage_check_zero_slippage() {
+        let executor = test_executor();
+
+        // No slippage
+        assert!(executor.check_slippage(dec!(50000), dec!(50000)));
+    }
+
+    // =========================================================================
+    // Quantity Rounding Tests
+    // =========================================================================
+
+    #[test]
+    fn test_round_quantity_default_precision() {
+        let executor = test_executor();
+
+        // No precision set, defaults to 3
+        let rounded = executor.round_quantity(dec!(1.23456789), "BTCUSDT");
+        assert_eq!(rounded, dec!(1.235));
+    }
+
+    #[test]
+    fn test_round_quantity_custom_precision() {
+        let mut executor = test_executor();
+        let mut precisions = HashMap::new();
+        precisions.insert("BTCUSDT".to_string(), 5);
+        executor.set_precisions(precisions);
+
+        let rounded = executor.round_quantity(dec!(1.23456789), "BTCUSDT");
+        assert_eq!(rounded, dec!(1.23457));
+    }
+
+    #[test]
+    fn test_round_quantity_zero_precision() {
+        let mut executor = test_executor();
+        let mut precisions = HashMap::new();
+        precisions.insert("BTCUSDT".to_string(), 0);
+        executor.set_precisions(precisions);
+
+        let rounded = executor.round_quantity(dec!(1.9), "BTCUSDT");
+        assert_eq!(rounded, dec!(2));
+    }
+
+    #[test]
+    fn test_round_quantity_different_symbols() {
+        let mut executor = test_executor();
+        let mut precisions = HashMap::new();
+        precisions.insert("BTCUSDT".to_string(), 5);
+        precisions.insert("ETHUSDT".to_string(), 4);
+        precisions.insert("SOLUSDT".to_string(), 2);
+        executor.set_precisions(precisions);
+
+        assert_eq!(executor.round_quantity(dec!(0.123456), "BTCUSDT"), dec!(0.12346));
+        assert_eq!(executor.round_quantity(dec!(0.123456), "ETHUSDT"), dec!(0.1235));
+        assert_eq!(executor.round_quantity(dec!(0.123456), "SOLUSDT"), dec!(0.12));
+    }
+
+    // =========================================================================
+    // Entry Result Tests
+    // =========================================================================
+
+    #[test]
+    fn test_entry_result_success_fields() {
+        let result = EntryResult {
+            symbol: "BTCUSDT".to_string(),
+            spot_order: None,
+            futures_order: None,
+            success: true,
+            error: None,
+        };
+
+        assert!(result.success);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_entry_result_failure_with_error() {
+        let result = EntryResult {
+            symbol: "BTCUSDT".to_string(),
+            spot_order: None,
+            futures_order: None,
+            success: false,
+            error: Some("Test error".to_string()),
+        };
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert_eq!(result.error.unwrap(), "Test error");
+    }
+
+    // =========================================================================
+    // Allocation Tests (Position Side Logic)
+    // =========================================================================
+
+    #[test]
+    fn test_positive_funding_determines_short_futures() {
+        let alloc = test_allocation("BTCUSDT", dec!(0.001), dec!(10000));
+
+        // Positive funding: short futures earns funding
+        assert!(alloc.funding_rate > Decimal::ZERO);
+
+        // In the executor, positive funding means:
+        // spot_side = Buy, futures_side = Sell
+        let is_positive = alloc.funding_rate > Decimal::ZERO;
+        assert!(is_positive);
+    }
+
+    #[test]
+    fn test_negative_funding_determines_long_futures() {
+        let alloc = test_allocation("BTCUSDT", dec!(-0.001), dec!(10000));
+
+        // Negative funding: long futures earns funding
+        assert!(alloc.funding_rate < Decimal::ZERO);
+
+        // In the executor, negative funding means:
+        // spot_side = Sell, futures_side = Buy
+        let is_positive = alloc.funding_rate > Decimal::ZERO;
+        assert!(!is_positive);
+    }
+
+    // =========================================================================
+    // Delta Calculation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_delta_mismatch_calculation() {
+        // Simulate delta check from enter_position
+        let futures_qty = dec!(1.0);
+        let spot_qty = dec!(0.95); // 5% difference
+
+        let delta_diff = (futures_qty - spot_qty).abs();
+        let delta_pct = if futures_qty > dec!(0) {
+            delta_diff / futures_qty * dec!(100)
+        } else {
+            dec!(0)
+        };
+
+        assert_eq!(delta_pct, dec!(5));
+
+        // 5% is at the threshold - should still succeed
+        let success = delta_pct <= dec!(5);
+        assert!(success);
+    }
+
+    #[test]
+    fn test_delta_mismatch_above_threshold() {
+        let futures_qty = dec!(1.0);
+        let spot_qty = dec!(0.90); // 10% difference
+
+        let delta_diff = (futures_qty - spot_qty).abs();
+        let delta_pct = delta_diff / futures_qty * dec!(100);
+
+        assert_eq!(delta_pct, dec!(10));
+
+        // 10% exceeds 5% threshold - should fail
+        let success = delta_pct <= dec!(5);
+        assert!(!success);
+    }
+
+    #[test]
+    fn test_delta_perfect_match() {
+        let futures_qty = dec!(1.0);
+        let spot_qty = dec!(1.0);
+
+        let delta_diff = (futures_qty - spot_qty).abs();
+        let delta_pct = delta_diff / futures_qty * dec!(100);
+
+        assert_eq!(delta_pct, Decimal::ZERO);
+        assert!(delta_pct <= dec!(5));
+    }
+
+    #[test]
+    fn test_delta_warning_threshold() {
+        // The code warns at > 1% but allows up to 5%
+        let futures_qty = dec!(1.0);
+        let spot_qty = dec!(0.98); // 2% difference
+
+        let delta_diff = (futures_qty - spot_qty).abs();
+        let delta_pct = delta_diff / futures_qty * dec!(100);
+
+        assert_eq!(delta_pct, dec!(2));
+
+        // Exceeds warning threshold (1%) but within success threshold (5%)
+        let warn = delta_pct > dec!(1);
+        let success = delta_pct <= dec!(5);
+
+        assert!(warn);
+        assert!(success);
+    }
+
+    // =========================================================================
+    // Executor Config Tests
+    // =========================================================================
+
+    #[test]
+    fn test_executor_creation() {
+        let config = ExecutionConfig {
+            default_leverage: 5,
+            max_leverage: 10,
+            slippage_tolerance: dec!(0.001),
+            order_timeout_secs: 60,
+        };
+
+        let executor = OrderExecutor::new(config);
+        // Executor created successfully
+        assert!(executor.precisions.is_empty());
+    }
+
+    #[test]
+    fn test_set_precisions() {
+        let mut executor = test_executor();
+
+        let mut precisions = HashMap::new();
+        precisions.insert("BTCUSDT".to_string(), 5);
+        precisions.insert("ETHUSDT".to_string(), 4);
+
+        executor.set_precisions(precisions.clone());
+
+        assert_eq!(executor.precisions.len(), 2);
+        assert_eq!(executor.precisions.get("BTCUSDT"), Some(&5u8));
+        assert_eq!(executor.precisions.get("ETHUSDT"), Some(&4u8));
     }
 }

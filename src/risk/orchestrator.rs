@@ -746,6 +746,542 @@ mod tests {
         let result = orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
         assert!(!result.should_halt);
     }
+
+    // =========================================================================
+    // RiskOrchestratorConfig Tests
+    // =========================================================================
+
+    #[test]
+    fn test_config_default_values() {
+        let config = RiskOrchestratorConfig::default();
+
+        assert_eq!(config.max_drawdown, dec!(0.05));
+        assert_eq!(config.min_margin_ratio, dec!(3.0));
+        assert_eq!(config.max_single_position, dec!(0.30));
+        assert_eq!(config.max_unprofitable_hours, 48);
+        assert_eq!(config.min_expected_yield, dec!(0.10));
+        assert_eq!(config.grace_period_hours, 8);
+        assert_eq!(config.max_funding_deviation, dec!(0.20));
+        assert_eq!(config.max_errors_per_minute, 10);
+        assert_eq!(config.max_consecutive_failures, 3);
+        assert_eq!(config.emergency_delta_drift, dec!(0.10));
+        assert_eq!(config.max_consecutive_risk_cycles, 3);
+    }
+
+    // =========================================================================
+    // RiskAlert Tests
+    // =========================================================================
+
+    #[test]
+    fn test_risk_alert_creation() {
+        let alert = RiskAlert::new(
+            RiskAlertType::DrawdownExceeded {
+                current: dec!(0.06),
+                limit: dec!(0.05),
+            },
+            AlertSeverity::Critical,
+            None,
+            "Drawdown exceeded".to_string(),
+            "Halt trading".to_string(),
+        );
+
+        assert!(alert.alert_id.starts_with("risk-"));
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+        assert!(alert.symbol.is_none());
+        assert_eq!(alert.message, "Drawdown exceeded");
+        assert_eq!(alert.suggested_action, "Halt trading");
+    }
+
+    #[test]
+    fn test_risk_alert_with_metric() {
+        let alert = RiskAlert::new(
+            RiskAlertType::DrawdownExceeded {
+                current: dec!(0.06),
+                limit: dec!(0.05),
+            },
+            AlertSeverity::Critical,
+            None,
+            "Test".to_string(),
+            "Test action".to_string(),
+        )
+        .with_metric("drawdown_pct", dec!(0.06))
+        .with_metric("max_drawdown", dec!(0.05));
+
+        assert_eq!(alert.metrics.get("drawdown_pct"), Some(&dec!(0.06)));
+        assert_eq!(alert.metrics.get("max_drawdown"), Some(&dec!(0.05)));
+    }
+
+    #[test]
+    fn test_risk_alert_with_symbol() {
+        let alert = RiskAlert::new(
+            RiskAlertType::LiquidationRisk {
+                action: LiquidationAction::ClosePosition { symbol: "BTCUSDT".to_string() },
+            },
+            AlertSeverity::Critical,
+            Some("BTCUSDT".to_string()),
+            "Close position".to_string(),
+            "Close immediately".to_string(),
+        );
+
+        assert_eq!(alert.symbol, Some("BTCUSDT".to_string()));
+    }
+
+    // =========================================================================
+    // RiskCheckResult Tests
+    // =========================================================================
+
+    #[test]
+    fn test_risk_check_result_default() {
+        let result = RiskCheckResult::default();
+
+        assert!(!result.should_halt);
+        assert!(!result.should_reduce_exposure);
+        assert!(result.alerts.is_empty());
+        assert!(result.positions_to_close.is_empty());
+        assert_eq!(result.margin_health, MarginHealth::Green);
+        assert_eq!(result.drawdown_pct, Decimal::ZERO);
+        assert!(!result.malfunction_detected);
+    }
+
+    // =========================================================================
+    // RiskAlertType Tests
+    // =========================================================================
+
+    #[test]
+    fn test_risk_alert_type_equality() {
+        let alert1 = RiskAlertType::DrawdownExceeded {
+            current: dec!(0.06),
+            limit: dec!(0.05),
+        };
+        let alert2 = RiskAlertType::DrawdownExceeded {
+            current: dec!(0.06),
+            limit: dec!(0.05),
+        };
+        let alert3 = RiskAlertType::DrawdownExceeded {
+            current: dec!(0.07),
+            limit: dec!(0.05),
+        };
+
+        assert_eq!(alert1, alert2);
+        assert_ne!(alert1, alert3);
+    }
+
+    #[test]
+    fn test_risk_alert_type_margin_warning() {
+        let alert = RiskAlertType::MarginWarning {
+            health: MarginHealth::Yellow,
+            action: "Reduce positions".to_string(),
+        };
+
+        match alert {
+            RiskAlertType::MarginWarning { health, action } => {
+                assert_eq!(health, MarginHealth::Yellow);
+                assert_eq!(action, "Reduce positions");
+            }
+            _ => panic!("Expected MarginWarning"),
+        }
+    }
+
+    #[test]
+    fn test_risk_alert_type_position_loss() {
+        let alert = RiskAlertType::PositionLoss {
+            symbol: "BTCUSDT".to_string(),
+            reason: "Unprofitable for 48h".to_string(),
+            hours: 48,
+        };
+
+        match alert {
+            RiskAlertType::PositionLoss { symbol, reason, hours } => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert_eq!(hours, 48);
+                assert!(reason.contains("48h"));
+            }
+            _ => panic!("Expected PositionLoss"),
+        }
+    }
+
+    #[test]
+    fn test_risk_alert_type_funding_anomaly() {
+        let alert = RiskAlertType::FundingAnomaly {
+            symbol: "ETHUSDT".to_string(),
+            deviation: dec!(0.25),
+        };
+
+        match alert {
+            RiskAlertType::FundingAnomaly { symbol, deviation } => {
+                assert_eq!(symbol, "ETHUSDT");
+                assert_eq!(deviation, dec!(0.25));
+            }
+            _ => panic!("Expected FundingAnomaly"),
+        }
+    }
+
+    #[test]
+    fn test_risk_alert_type_delta_drift() {
+        let alert = RiskAlertType::DeltaDrift {
+            symbol: "BTCUSDT".to_string(),
+            drift_pct: dec!(0.15),
+        };
+
+        match alert {
+            RiskAlertType::DeltaDrift { symbol, drift_pct } => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert_eq!(drift_pct, dec!(0.15));
+            }
+            _ => panic!("Expected DeltaDrift"),
+        }
+    }
+
+    // =========================================================================
+    // Drawdown Check Tests
+    // =========================================================================
+
+    #[test]
+    fn test_check_all_drawdown_exceeded() {
+        let config = RiskOrchestratorConfig {
+            max_drawdown: dec!(0.05),
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Drop equity by 6% (exceeds 5% max)
+        let result = orchestrator.check_all(
+            &[],
+            dec!(9400), // 6% drawdown
+            dec!(10000),
+            &HashMap::new(),
+        );
+
+        assert!(result.should_halt);
+        assert!(result.drawdown_pct >= dec!(0.05));
+
+        let has_drawdown_alert = result.alerts.iter().any(|a| {
+            matches!(&a.alert_type, RiskAlertType::DrawdownExceeded { .. })
+        });
+        assert!(has_drawdown_alert);
+    }
+
+    #[test]
+    fn test_check_all_drawdown_safe() {
+        let config = RiskOrchestratorConfig {
+            max_drawdown: dec!(0.10),
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Only 3% drawdown - safe
+        let result = orchestrator.check_all(
+            &[],
+            dec!(9700),
+            dec!(10000),
+            &HashMap::new(),
+        );
+
+        assert!(!result.should_halt);
+        assert_eq!(result.drawdown_pct, dec!(0.03));
+    }
+
+    // =========================================================================
+    // Margin Health Check Tests
+    // =========================================================================
+
+    #[test]
+    fn test_check_all_margin_red_halts() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Position with very low margin = RED health
+        let position = crate::exchange::Position {
+            symbol: "BTCUSDT".to_string(),
+            position_amt: dec!(1.0),
+            entry_price: dec!(50000),
+            unrealized_profit: Decimal::ZERO,
+            leverage: 10,
+            notional: dec!(50000),
+            isolated_margin: dec!(50), // Very low margin
+            mark_price: dec!(50000),
+            liquidation_price: dec!(45000),
+            position_side: crate::exchange::PositionSide::Both,
+            margin_type: crate::exchange::MarginType::Isolated,
+        };
+
+        let mut rates = HashMap::new();
+        rates.insert("BTCUSDT".to_string(), dec!(0.004));
+
+        let result = orchestrator.check_all(&[position], dec!(10000), dec!(100000), &rates);
+
+        // Margin ratio = 50 / (50000 * 0.004) = 50 / 200 = 0.25 -> RED
+        assert!(result.should_halt);
+        assert!(result.should_reduce_exposure);
+        assert_eq!(result.margin_health, MarginHealth::Red);
+    }
+
+    #[test]
+    fn test_check_all_margin_orange_reduces_exposure() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Position with moderate margin = ORANGE health
+        let position = crate::exchange::Position {
+            symbol: "BTCUSDT".to_string(),
+            position_amt: dec!(1.0),
+            entry_price: dec!(50000),
+            unrealized_profit: Decimal::ZERO,
+            leverage: 10,
+            notional: dec!(10000),
+            isolated_margin: dec!(100), // ratio = 100 / 40 = 2.5 -> ORANGE
+            mark_price: dec!(50000),
+            liquidation_price: dec!(45000),
+            position_side: crate::exchange::PositionSide::Both,
+            margin_type: crate::exchange::MarginType::Isolated,
+        };
+
+        let mut rates = HashMap::new();
+        rates.insert("BTCUSDT".to_string(), dec!(0.004));
+
+        let result = orchestrator.check_all(&[position], dec!(10000), dec!(100000), &rates);
+
+        assert!(!result.should_halt);
+        assert!(result.should_reduce_exposure);
+        assert_eq!(result.margin_health, MarginHealth::Orange);
+    }
+
+    // =========================================================================
+    // Order Recording Tests
+    // =========================================================================
+
+    #[test]
+    fn test_record_order_success_and_failure() {
+        let config = RiskOrchestratorConfig {
+            max_consecutive_failures: 3,
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Success should not trigger alert
+        orchestrator.record_order_success("BTCUSDT");
+        assert!(!orchestrator.check_malfunctions());
+
+        // First failures should not trigger
+        assert!(orchestrator.record_order_failure("BTCUSDT").is_none());
+        assert!(orchestrator.record_order_failure("BTCUSDT").is_none());
+
+        // Third failure should trigger
+        assert!(orchestrator.record_order_failure("BTCUSDT").is_some());
+    }
+
+    // =========================================================================
+    // Delta Drift Tests
+    // =========================================================================
+
+    #[test]
+    fn test_delta_drift_check() {
+        let config = RiskOrchestratorConfig {
+            emergency_delta_drift: dec!(0.10), // 10%
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Small drift - no alert
+        let alert1 = orchestrator.check_delta_drift("BTCUSDT", dec!(0.05));
+        assert!(alert1.is_none());
+
+        // Large drift - should alert
+        let alert2 = orchestrator.check_delta_drift("BTCUSDT", dec!(0.15));
+        assert!(alert2.is_some());
+    }
+
+    // =========================================================================
+    // Funding Verification Tests
+    // =========================================================================
+
+    #[test]
+    fn test_verify_funding_no_position() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // No position tracked - should return safe default
+        let result = orchestrator.verify_funding("BTCUSDT", dec!(5));
+
+        assert_eq!(result.symbol, "BTCUSDT");
+        assert_eq!(result.funding_received, dec!(5));
+        assert!(!result.is_anomaly);
+    }
+
+    #[test]
+    fn test_record_funding() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Open position
+        let entry = PositionEntry {
+            symbol: "BTCUSDT".to_string(),
+            entry_price: dec!(50000),
+            quantity: dec!(0.1),
+            expected_funding_rate: dec!(0.0001),
+            entry_fees: dec!(2),
+            position_value: dec!(5000),
+        };
+        orchestrator.open_position(entry);
+
+        // Record funding
+        orchestrator.record_funding("BTCUSDT", dec!(0.5));
+
+        // Position should be updated
+        let pos = orchestrator.get_tracked_position("BTCUSDT").unwrap();
+        assert_eq!(pos.total_funding_received, dec!(0.5));
+    }
+
+    // =========================================================================
+    // Should Halt Tests
+    // =========================================================================
+
+    #[test]
+    fn test_should_halt_from_drawdown() {
+        let config = RiskOrchestratorConfig {
+            max_drawdown: dec!(0.05),
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Initially should not halt
+        assert!(!orchestrator.should_halt());
+
+        // Trigger drawdown
+        orchestrator.check_all(&[], dec!(9400), dec!(10000), &HashMap::new());
+
+        // Now should halt
+        assert!(orchestrator.should_halt());
+    }
+
+    // =========================================================================
+    // Reset Halt Tests
+    // =========================================================================
+
+    #[test]
+    fn test_reset_halt() {
+        let config = RiskOrchestratorConfig {
+            max_errors_per_minute: 1,
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Trigger halt via malfunction
+        orchestrator.record_error("error1");
+        orchestrator.record_error("error2");
+        assert!(orchestrator.check_malfunctions());
+
+        // Reset halt
+        orchestrator.reset_halt();
+        assert!(!orchestrator.check_malfunctions());
+    }
+
+    // =========================================================================
+    // Interest Recording Tests
+    // =========================================================================
+
+    #[test]
+    fn test_record_interest() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Open position
+        let entry = PositionEntry {
+            symbol: "BTCUSDT".to_string(),
+            entry_price: dec!(50000),
+            quantity: dec!(0.1),
+            expected_funding_rate: dec!(0.0001),
+            entry_fees: dec!(2),
+            position_value: dec!(5000),
+        };
+        orchestrator.open_position(entry);
+
+        // Record interest
+        orchestrator.record_interest("BTCUSDT", dec!(0.5));
+
+        // Position should be updated
+        let pos = orchestrator.get_tracked_position("BTCUSDT").unwrap();
+        assert_eq!(pos.interest_paid, dec!(0.5));
+    }
+
+    // =========================================================================
+    // PnL Update Tests
+    // =========================================================================
+
+    #[test]
+    fn test_update_position_pnl() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Open position
+        let entry = PositionEntry {
+            symbol: "BTCUSDT".to_string(),
+            entry_price: dec!(50000),
+            quantity: dec!(0.1),
+            expected_funding_rate: dec!(0.0001),
+            entry_fees: dec!(2),
+            position_value: dec!(5000),
+        };
+        orchestrator.open_position(entry);
+
+        // Update PnL
+        orchestrator.update_position_pnl("BTCUSDT", dec!(100));
+
+        // Position should be updated
+        let pos = orchestrator.get_tracked_position("BTCUSDT").unwrap();
+        assert_eq!(pos.unrealized_pnl, dec!(100));
+    }
+
+    // =========================================================================
+    // Get All Tracked Positions Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_all_tracked_positions() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Open multiple positions
+        orchestrator.open_position(PositionEntry {
+            symbol: "BTCUSDT".to_string(),
+            entry_price: dec!(50000),
+            quantity: dec!(0.1),
+            expected_funding_rate: dec!(0.0001),
+            entry_fees: dec!(2),
+            position_value: dec!(5000),
+        });
+
+        orchestrator.open_position(PositionEntry {
+            symbol: "ETHUSDT".to_string(),
+            entry_price: dec!(3000),
+            quantity: dec!(1.0),
+            expected_funding_rate: dec!(0.00015),
+            entry_fees: dec!(1),
+            position_value: dec!(3000),
+        });
+
+        let positions = orchestrator.get_all_tracked_positions();
+        assert_eq!(positions.len(), 2);
+    }
+
+    // =========================================================================
+    // Drawdown Stats Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_drawdown_stats() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Create some history
+        orchestrator.check_all(&[], dec!(11000), dec!(10000), &HashMap::new());
+        orchestrator.check_all(&[], dec!(10500), dec!(10000), &HashMap::new());
+
+        let stats = orchestrator.get_drawdown_stats();
+
+        assert_eq!(stats.peak_equity, dec!(11000));
+        assert_eq!(stats.current_equity, dec!(10500));
+    }
 }
 
 

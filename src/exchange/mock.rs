@@ -530,6 +530,82 @@ impl MockBinanceClient {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Helper functions
+    // =========================================================================
+
+    fn create_test_client() -> MockBinanceClient {
+        MockBinanceClient::new(dec!(10000))
+    }
+
+    async fn setup_client_with_price(price: Decimal) -> MockBinanceClient {
+        let client = create_test_client();
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), price);
+        client.update_market_data(HashMap::new(), prices).await;
+        client
+    }
+
+    async fn open_short_futures_position(
+        client: &MockBinanceClient,
+        symbol: &str,
+        quantity: Decimal,
+    ) -> OrderResponse {
+        let order = NewOrder {
+            symbol: symbol.to_string(),
+            side: OrderSide::Sell,
+            position_side: None,
+            order_type: OrderType::Market,
+            quantity: Some(quantity),
+            price: None,
+            time_in_force: None,
+            reduce_only: None,
+            new_client_order_id: None,
+        };
+        client.place_futures_order(&order).await.unwrap()
+    }
+
+    async fn open_long_futures_position(
+        client: &MockBinanceClient,
+        symbol: &str,
+        quantity: Decimal,
+    ) -> OrderResponse {
+        let order = NewOrder {
+            symbol: symbol.to_string(),
+            side: OrderSide::Buy,
+            position_side: None,
+            order_type: OrderType::Market,
+            quantity: Some(quantity),
+            price: None,
+            time_in_force: None,
+            reduce_only: None,
+            new_client_order_id: None,
+        };
+        client.place_futures_order(&order).await.unwrap()
+    }
+
+    async fn open_margin_short(
+        client: &MockBinanceClient,
+        symbol: &str,
+        quantity: Decimal,
+    ) -> OrderResponse {
+        let order = MarginOrder {
+            symbol: symbol.to_string(),
+            side: OrderSide::Sell,
+            order_type: OrderType::Market,
+            quantity: Some(quantity),
+            price: None,
+            time_in_force: None,
+            side_effect_type: Some(SideEffectType::MarginBuy),
+            is_isolated: None,
+        };
+        client.place_margin_order(&order).await.unwrap()
+    }
+
+    // =========================================================================
+    // Basic Order Execution Tests
+    // =========================================================================
+
     #[tokio::test]
     async fn test_mock_order_execution() {
         let client = MockBinanceClient::new(dec!(10000));
@@ -559,5 +635,624 @@ mod tests {
         let state = client.get_state().await;
         assert_eq!(state.order_count, 1);
         assert!(state.total_trading_fees > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_open_long_position() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        let response = open_long_futures_position(&client, "BTCUSDT", dec!(0.5)).await;
+
+        assert_eq!(response.status, OrderStatus::Filled);
+        assert_eq!(response.executed_qty, dec!(0.5));
+
+        let state = client.get_state().await;
+        let position = state.positions.get("BTCUSDT").unwrap();
+        assert_eq!(position.futures_qty, dec!(0.5)); // Positive = long
+        assert_eq!(position.futures_entry_price, dec!(50000));
+    }
+
+    #[tokio::test]
+    async fn test_open_short_position() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        let response = open_short_futures_position(&client, "BTCUSDT", dec!(0.5)).await;
+
+        assert_eq!(response.status, OrderStatus::Filled);
+
+        let state = client.get_state().await;
+        let position = state.positions.get("BTCUSDT").unwrap();
+        assert_eq!(position.futures_qty, dec!(-0.5)); // Negative = short
+    }
+
+    #[tokio::test]
+    async fn test_close_position_reduces_to_zero() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        // Open short
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+        // Close with buy
+        open_long_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let state = client.get_state().await;
+        let position = state.positions.get("BTCUSDT").unwrap();
+        assert_eq!(position.futures_qty, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_reduce_position_partial_close() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        // Open short 1.0 BTC
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+        // Close 0.3 BTC
+        open_long_futures_position(&client, "BTCUSDT", dec!(0.3)).await;
+
+        let state = client.get_state().await;
+        let position = state.positions.get("BTCUSDT").unwrap();
+        assert_eq!(position.futures_qty, dec!(-0.7)); // 1.0 - 0.3 = 0.7 remaining short
+    }
+
+    // =========================================================================
+    // Funding Collection Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_funding_positive_rate_short_receives() {
+        let client = create_test_client();
+
+        // Setup: Short position + positive funding rate
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        rates.insert("BTCUSDT".to_string(), dec!(0.001)); // 0.1% positive rate
+        client.update_market_data(rates.clone(), prices.clone()).await;
+
+        // Open short futures position (qty = -1.0)
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let balance_before = client.get_state().await.balance;
+
+        // Collect funding
+        let funding_map = client.collect_funding().await;
+
+        let balance_after = client.get_state().await.balance;
+        let funding_received = funding_map.get("BTCUSDT").copied().unwrap_or_default();
+
+        // Short (-1.0) * price (50000) * rate (0.001) = -50
+        // But formula is: -futures_value * rate = -(-50000) * 0.001 = +50
+        assert_eq!(funding_received, dec!(50));
+        assert_eq!(balance_after - balance_before, dec!(50));
+    }
+
+    #[tokio::test]
+    async fn test_funding_negative_rate_long_receives() {
+        let client = create_test_client();
+
+        // Setup: Long position + negative funding rate
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        rates.insert("BTCUSDT".to_string(), dec!(-0.001)); // -0.1% negative rate
+        client.update_market_data(rates, prices).await;
+
+        // Open long futures position (qty = +1.0)
+        open_long_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let balance_before = client.get_state().await.balance;
+
+        // Collect funding
+        let funding_map = client.collect_funding().await;
+
+        let balance_after = client.get_state().await.balance;
+        let funding_received = funding_map.get("BTCUSDT").copied().unwrap_or_default();
+
+        // Long (+1.0) * price (50000) * rate (-0.001) = -50 (value)
+        // Formula: -futures_value * rate = -(50000) * (-0.001) = +50
+        assert_eq!(funding_received, dec!(50));
+        assert!(balance_after > balance_before);
+    }
+
+    #[tokio::test]
+    async fn test_funding_zero_rate_no_payment() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        rates.insert("BTCUSDT".to_string(), Decimal::ZERO);
+        client.update_market_data(rates, prices).await;
+
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let balance_before = client.get_state().await.balance;
+        let funding_map = client.collect_funding().await;
+        let balance_after = client.get_state().await.balance;
+
+        let funding_received = funding_map.get("BTCUSDT").copied().unwrap_or_default();
+        assert_eq!(funding_received, Decimal::ZERO);
+        assert_eq!(balance_before, balance_after);
+    }
+
+    #[tokio::test]
+    async fn test_funding_extreme_rate_calculated_correctly() {
+        let client = create_test_client();
+
+        // Extreme rate like what was seen with DUSKUSDT (-1% per 8h)
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("DUSKUSDT".to_string(), dec!(0.5)); // $0.50 price
+        rates.insert("DUSKUSDT".to_string(), dec!(-0.01)); // -1% extreme rate
+        client.update_market_data(rates, prices).await;
+
+        // Long position with negative rate = receive funding
+        open_long_futures_position(&client, "DUSKUSDT", dec!(10000.0)).await; // 10k DUSK
+
+        let funding_map = client.collect_funding().await;
+        let funding = funding_map.get("DUSKUSDT").copied().unwrap_or_default();
+
+        // Position value: 10000 * 0.5 = $5000
+        // Funding: -5000 * -0.01 = $50
+        assert_eq!(funding, dec!(50));
+    }
+
+    #[tokio::test]
+    async fn test_funding_tracks_per_position() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        prices.insert("ETHUSDT".to_string(), dec!(3000));
+        rates.insert("BTCUSDT".to_string(), dec!(0.0005)); // 0.05%
+        rates.insert("ETHUSDT".to_string(), dec!(0.001)); // 0.1%
+        client.update_market_data(rates, prices).await;
+
+        open_short_futures_position(&client, "BTCUSDT", dec!(0.1)).await;
+        open_short_futures_position(&client, "ETHUSDT", dec!(1.0)).await;
+
+        // Collect funding multiple times
+        client.collect_funding().await;
+        client.collect_funding().await;
+
+        let state = client.get_state().await;
+
+        let btc_pos = state.positions.get("BTCUSDT").unwrap();
+        let eth_pos = state.positions.get("ETHUSDT").unwrap();
+
+        // BTC: 0.1 * 50000 * 0.0005 = $2.50 per collection, x2 = $5
+        assert_eq!(btc_pos.funding_collections, 2);
+        assert_eq!(btc_pos.total_funding_received, dec!(5));
+
+        // ETH: 1.0 * 3000 * 0.001 = $3 per collection, x2 = $6
+        assert_eq!(eth_pos.funding_collections, 2);
+        assert_eq!(eth_pos.total_funding_received, dec!(6));
+    }
+
+    // =========================================================================
+    // Interest Accrual Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_interest_accrual_hourly() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        // Open margin short to create borrowed amount
+        open_margin_short(&client, "BTCUSDT", dec!(0.2)).await;
+
+        let balance_before = client.get_state().await.balance;
+
+        // Accrue 8 hours of interest
+        let interest_map = client.accrue_interest(dec!(8)).await;
+
+        let state = client.get_state().await;
+        let interest_paid = interest_map.get("BTCUSDT").copied().unwrap_or_default();
+
+        // Borrowed: 0.2 BTC
+        // Interest: 0.2 * 0.00002 * 8 = 0.000032 BTC
+        // But we track in USDT, so: borrowed_amount (in USDT terms) * rate * hours
+        // Actually borrowed_amount is tracked as abs(spot_qty) = 0.2
+        // Interest = 0.2 * 0.00002 * 8 = 0.000032
+        assert!(interest_paid > Decimal::ZERO);
+        assert!(state.balance < balance_before);
+    }
+
+    #[tokio::test]
+    async fn test_interest_accrual_partial_hour() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        open_margin_short(&client, "BTCUSDT", dec!(1.0)).await;
+
+        // Accrue 0.5 hours
+        let interest_map = client.accrue_interest(dec!(0.5)).await;
+
+        let interest = interest_map.get("BTCUSDT").copied().unwrap_or_default();
+
+        // Interest = 1.0 * 0.00002 * 0.5 = 0.00001
+        assert_eq!(interest, dec!(0.00001));
+    }
+
+    #[tokio::test]
+    async fn test_interest_no_borrow_no_accrual() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        // Open futures only (no margin borrow)
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let balance_before = client.get_state().await.balance;
+
+        let interest_map = client.accrue_interest(dec!(24)).await;
+
+        let balance_after = client.get_state().await.balance;
+
+        // No interest should be charged since no borrowed amount
+        assert!(interest_map.is_empty() || interest_map.values().all(|&v| v == Decimal::ZERO));
+        assert_eq!(balance_before, balance_after);
+    }
+
+    #[tokio::test]
+    async fn test_interest_tracks_per_position() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        prices.insert("ETHUSDT".to_string(), dec!(3000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        open_margin_short(&client, "BTCUSDT", dec!(0.1)).await;
+        open_margin_short(&client, "ETHUSDT", dec!(2.0)).await;
+
+        client.accrue_interest(dec!(10)).await;
+
+        let state = client.get_state().await;
+        let btc_pos = state.positions.get("BTCUSDT").unwrap();
+        let eth_pos = state.positions.get("ETHUSDT").unwrap();
+
+        // BTC: 0.1 * 0.00002 * 10 = 0.00002
+        assert_eq!(btc_pos.total_interest_paid, dec!(0.00002));
+
+        // ETH: 2.0 * 0.00002 * 10 = 0.0004
+        assert_eq!(eth_pos.total_interest_paid, dec!(0.0004));
+    }
+
+    // =========================================================================
+    // Fee Calculation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_trading_fee_calculation() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        let balance_before = client.get_state().await.balance;
+
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let state = client.get_state().await;
+
+        // Fee = qty * price * 0.0004 = 1.0 * 50000 * 0.0004 = $20
+        assert_eq!(state.total_trading_fees, dec!(20));
+        assert_eq!(state.balance, balance_before - dec!(20));
+    }
+
+    #[tokio::test]
+    async fn test_fee_accumulation_multiple_trades() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        // Trade 1: 0.5 BTC short
+        open_short_futures_position(&client, "BTCUSDT", dec!(0.5)).await;
+        // Trade 2: 0.3 BTC long (partial close)
+        open_long_futures_position(&client, "BTCUSDT", dec!(0.3)).await;
+        // Trade 3: 0.2 BTC long (complete close)
+        open_long_futures_position(&client, "BTCUSDT", dec!(0.2)).await;
+
+        let state = client.get_state().await;
+
+        // Total fees:
+        // Trade 1: 0.5 * 50000 * 0.0004 = $10
+        // Trade 2: 0.3 * 50000 * 0.0004 = $6
+        // Trade 3: 0.2 * 50000 * 0.0004 = $4
+        // Total: $20
+        assert_eq!(state.total_trading_fees, dec!(20));
+        assert_eq!(state.order_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_margin_order_fee_calculation() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        let balance_before = client.get_state().await.balance;
+
+        open_margin_short(&client, "BTCUSDT", dec!(0.5)).await;
+
+        let state = client.get_state().await;
+
+        // Fee = 0.5 * 50000 * 0.0004 = $10
+        assert_eq!(state.total_trading_fees, dec!(10));
+        assert_eq!(state.balance, balance_before - dec!(10));
+    }
+
+    // =========================================================================
+    // Margin Operations Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_borrow_spot_margin() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        open_margin_short(&client, "BTCUSDT", dec!(1.0)).await;
+
+        let state = client.get_state().await;
+        let position = state.positions.get("BTCUSDT").unwrap();
+
+        assert_eq!(position.spot_qty, dec!(-1.0));
+        assert_eq!(position.borrowed_amount, dec!(1.0));
+    }
+
+    #[tokio::test]
+    async fn test_margin_buy_long_no_borrow() {
+        let client = setup_client_with_price(dec!(50000)).await;
+
+        // Buy on margin (long) - no borrowing needed
+        let order = MarginOrder {
+            symbol: "BTCUSDT".to_string(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            quantity: Some(dec!(0.5)),
+            price: None,
+            time_in_force: None,
+            side_effect_type: Some(SideEffectType::MarginBuy),
+            is_isolated: None,
+        };
+        client.place_margin_order(&order).await.unwrap();
+
+        let state = client.get_state().await;
+        let position = state.positions.get("BTCUSDT").unwrap();
+
+        assert_eq!(position.spot_qty, dec!(0.5));
+        assert_eq!(position.borrowed_amount, Decimal::ZERO); // No borrow for long
+    }
+
+    // =========================================================================
+    // PnL Calculation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_price_update_affects_unrealized_pnl() {
+        let client = create_test_client();
+
+        // Initial price
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        // Open short at $50,000
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        // Price drops to $48,000 - short should be in profit
+        let mut new_prices = HashMap::new();
+        new_prices.insert("BTCUSDT".to_string(), dec!(48000));
+        client.update_market_data(HashMap::new(), new_prices).await;
+
+        let (_, unrealized_pnl) = client.calculate_pnl().await;
+
+        // Short PnL: -1.0 * (48000 - 50000) = -1.0 * -2000 = +$2000
+        assert_eq!(unrealized_pnl, dec!(2000));
+    }
+
+    #[tokio::test]
+    async fn test_unrealized_pnl_loss_scenario() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        // Open short at $50,000
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        // Price rises to $52,000 - short should be in loss
+        let mut new_prices = HashMap::new();
+        new_prices.insert("BTCUSDT".to_string(), dec!(52000));
+        client.update_market_data(HashMap::new(), new_prices).await;
+
+        let (_, unrealized_pnl) = client.calculate_pnl().await;
+
+        // Short PnL: -1.0 * (52000 - 50000) = -$2000
+        assert_eq!(unrealized_pnl, dec!(-2000));
+    }
+
+    #[tokio::test]
+    async fn test_realized_pnl_includes_all_components() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        rates.insert("BTCUSDT".to_string(), dec!(0.001));
+        client.update_market_data(rates, prices).await;
+
+        // Open position (creates fees)
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+        open_margin_short(&client, "BTCUSDT", dec!(1.0)).await;
+
+        // Collect funding
+        client.collect_funding().await;
+
+        // Accrue interest
+        client.accrue_interest(dec!(8)).await;
+
+        let (realized_pnl, _) = client.calculate_pnl().await;
+        let state = client.get_state().await;
+
+        // Realized PnL = funding - fees - interest
+        let expected = state.total_funding_received
+            - state.total_trading_fees
+            - state.total_borrow_interest;
+        assert_eq!(realized_pnl, expected);
+    }
+
+    // =========================================================================
+    // State Reset Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_reset_clears_all_state() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        rates.insert("BTCUSDT".to_string(), dec!(0.001));
+        client.update_market_data(rates, prices).await;
+
+        // Create some state
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+        open_margin_short(&client, "BTCUSDT", dec!(1.0)).await;
+        client.collect_funding().await;
+        client.accrue_interest(dec!(8)).await;
+
+        // Verify state exists
+        let state_before = client.get_state().await;
+        assert!(!state_before.positions.is_empty());
+        assert!(state_before.total_funding_received > Decimal::ZERO);
+
+        // Reset
+        client.reset(dec!(5000)).await;
+
+        // Verify all state cleared
+        let state_after = client.get_state().await;
+        assert_eq!(state_after.initial_balance, dec!(5000));
+        assert_eq!(state_after.balance, dec!(5000));
+        assert!(state_after.positions.is_empty());
+        assert_eq!(state_after.total_funding_received, Decimal::ZERO);
+        assert_eq!(state_after.total_trading_fees, Decimal::ZERO);
+        assert_eq!(state_after.total_borrow_interest, Decimal::ZERO);
+        assert_eq!(state_after.order_count, 0);
+    }
+
+    // =========================================================================
+    // Delta Neutral Position Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_delta_neutral_positions() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        client.update_market_data(HashMap::new(), prices).await;
+
+        // Create delta-neutral position: short futures + long spot
+        open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
+
+        // Buy on margin
+        let order = MarginOrder {
+            symbol: "BTCUSDT".to_string(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            quantity: Some(dec!(1.0)),
+            price: None,
+            time_in_force: None,
+            side_effect_type: Some(SideEffectType::MarginBuy),
+            is_isolated: None,
+        };
+        client.place_margin_order(&order).await.unwrap();
+
+        let positions = client.get_delta_neutral_positions().await;
+
+        assert_eq!(positions.len(), 1);
+        let pos = &positions[0];
+        assert_eq!(pos.symbol, "BTCUSDT");
+        assert_eq!(pos.futures_qty, dec!(-1.0));
+        assert_eq!(pos.spot_qty, dec!(1.0));
+        assert_eq!(pos.net_delta, Decimal::ZERO); // Delta neutral!
+    }
+
+    // =========================================================================
+    // State Persistence Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_and_restore_state() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        rates.insert("BTCUSDT".to_string(), dec!(0.001));
+        client.update_market_data(rates, prices).await;
+
+        // Create state
+        open_short_futures_position(&client, "BTCUSDT", dec!(0.5)).await;
+        client.collect_funding().await;
+
+        // Export
+        let exported = client.export_state().await;
+
+        // Create new client and restore
+        let client2 = create_test_client();
+        client2.restore_state(exported).await;
+
+        // Verify state matches
+        let state1 = client.get_state().await;
+        let state2 = client2.get_state().await;
+
+        assert_eq!(state1.balance, state2.balance);
+        assert_eq!(state1.total_funding_received, state2.total_funding_received);
+        assert_eq!(state1.positions.len(), state2.positions.len());
+    }
+
+    // =========================================================================
+    // Multiple Positions Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_multiple_positions_independent() {
+        let client = create_test_client();
+
+        let mut prices = HashMap::new();
+        let mut rates = HashMap::new();
+        prices.insert("BTCUSDT".to_string(), dec!(50000));
+        prices.insert("ETHUSDT".to_string(), dec!(3000));
+        prices.insert("SOLUSDT".to_string(), dec!(100));
+        rates.insert("BTCUSDT".to_string(), dec!(0.001));
+        rates.insert("ETHUSDT".to_string(), dec!(0.0005));
+        rates.insert("SOLUSDT".to_string(), dec!(-0.0002));
+        client.update_market_data(rates, prices).await;
+
+        // Open multiple positions
+        open_short_futures_position(&client, "BTCUSDT", dec!(0.1)).await;
+        open_short_futures_position(&client, "ETHUSDT", dec!(1.0)).await;
+        open_long_futures_position(&client, "SOLUSDT", dec!(10.0)).await;
+
+        client.collect_funding().await;
+
+        let state = client.get_state().await;
+
+        assert_eq!(state.positions.len(), 3);
+
+        // BTC: short 0.1 @ 50000 w/ 0.1% rate = $5 funding
+        let btc = state.positions.get("BTCUSDT").unwrap();
+        assert_eq!(btc.total_funding_received, dec!(5));
+
+        // ETH: short 1.0 @ 3000 w/ 0.05% rate = $1.5 funding
+        let eth = state.positions.get("ETHUSDT").unwrap();
+        assert_eq!(eth.total_funding_received, dec!(1.5));
+
+        // SOL: long 10.0 @ 100 w/ -0.02% rate = $0.2 funding
+        let sol = state.positions.get("SOLUSDT").unwrap();
+        assert_eq!(sol.total_funding_received, dec!(0.2));
     }
 }
