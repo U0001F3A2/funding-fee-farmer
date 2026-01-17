@@ -27,6 +27,9 @@ use super::{
     MalfunctionDetector, MalfunctionConfig, MalfunctionAlert, AlertSeverity,
 };
 
+/// Circuit breaker threshold: halt trading after this many consecutive cycles with ERROR/CRITICAL alerts
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
 /// Unified risk configuration.
 #[derive(Debug, Clone)]
 pub struct RiskOrchestratorConfig {
@@ -203,6 +206,8 @@ pub struct RiskOrchestrator {
     position_tracker: PositionTracker,
     funding_verifier: FundingVerifier,
     malfunction_detector: MalfunctionDetector,
+    /// Counter for consecutive cycles with ERROR/CRITICAL alerts (circuit breaker)
+    consecutive_alert_cycles: u32,
 }
 
 impl RiskOrchestrator {
@@ -247,6 +252,7 @@ impl RiskOrchestrator {
             funding_verifier: FundingVerifier::new(config.max_funding_deviation),
             malfunction_detector: MalfunctionDetector::new(malfunction_config),
             config,
+            consecutive_alert_cycles: 0,
         }
     }
 
@@ -415,6 +421,58 @@ impl RiskOrchestrator {
             result.malfunction_detected = true;
         }
 
+        // 6. Circuit breaker: check for consecutive cycles with ERROR/CRITICAL alerts
+        let has_critical_alerts = result.alerts.iter().any(|alert| {
+            matches!(alert.severity, AlertSeverity::Error | AlertSeverity::Critical)
+        });
+
+        if has_critical_alerts {
+            self.consecutive_alert_cycles += 1;
+            debug!(
+                consecutive_cycles = self.consecutive_alert_cycles,
+                threshold = CIRCUIT_BREAKER_THRESHOLD,
+                "Critical alerts detected in cycle"
+            );
+
+            if self.consecutive_alert_cycles >= CIRCUIT_BREAKER_THRESHOLD {
+                result.should_halt = true;
+                error!(
+                    consecutive_cycles = self.consecutive_alert_cycles,
+                    "Circuit breaker triggered: {} consecutive cycles with ERROR/CRITICAL alerts",
+                    self.consecutive_alert_cycles
+                );
+
+                // Add circuit breaker alert
+                result.alerts.push(
+                    RiskAlert::new(
+                        RiskAlertType::Malfunction {
+                            malfunction_type: format!(
+                                "Circuit breaker: {} consecutive error cycles",
+                                self.consecutive_alert_cycles
+                            ),
+                        },
+                        AlertSeverity::Critical,
+                        None,
+                        format!(
+                            "Trading halted: {} consecutive cycles with critical risk alerts",
+                            self.consecutive_alert_cycles
+                        ),
+                        "Manual intervention required - check system health and risk conditions".to_string(),
+                    )
+                    .with_metric("consecutive_cycles", Decimal::from(self.consecutive_alert_cycles)),
+                );
+            }
+        } else {
+            // Reset counter when cycle completes without critical alerts
+            if self.consecutive_alert_cycles > 0 {
+                info!(
+                    previous_count = self.consecutive_alert_cycles,
+                    "Resetting circuit breaker counter - no critical alerts in current cycle"
+                );
+                self.consecutive_alert_cycles = 0;
+            }
+        }
+
         // Emit all alerts
         for alert in &result.alerts {
             alert.emit();
@@ -539,6 +597,20 @@ impl RiskOrchestrator {
     pub fn reset_halt(&mut self) {
         self.malfunction_detector.reset_halt();
     }
+
+    /// Reset circuit breaker counter (for manual recovery).
+    pub fn reset_circuit_breaker(&mut self) {
+        info!(
+            previous_count = self.consecutive_alert_cycles,
+            "Manually resetting circuit breaker counter"
+        );
+        self.consecutive_alert_cycles = 0;
+    }
+
+    /// Get current circuit breaker count.
+    pub fn get_circuit_breaker_count(&self) -> u32 {
+        self.consecutive_alert_cycles
+    }
 }
 
 #[cfg(test)]
@@ -588,5 +660,100 @@ mod tests {
 
         // Third error should trigger alert
         assert!(orchestrator.record_error("test").is_some());
+    }
+
+    #[test]
+    fn test_circuit_breaker() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config.clone(), dec!(10000));
+
+        // Create a position that will trigger margin warnings (ERROR level)
+        let positions = vec![
+            crate::exchange::Position {
+                symbol: "BTCUSDT".to_string(),
+                position_amt: dec!(1.0),
+                entry_price: dec!(50000),
+                unrealized_profit: dec!(-1000), // Loss
+                leverage: 10,
+                notional: dec!(50000),
+                isolated_margin: Decimal::ZERO,
+                mark_price: dec!(49000),
+                liquidation_price: dec!(45000),
+                position_side: crate::exchange::PositionSide::Both,
+                margin_type: crate::exchange::MarginType::Cross,
+            },
+        ];
+
+        // Simulate low margin to trigger margin warnings
+        let low_margin = dec!(100); // Very low margin
+        let equity = dec!(5000);
+
+        // First cycle: should increment counter but not halt
+        let result1 = orchestrator.check_all(&positions, equity, low_margin);
+        assert!(!result1.should_halt || result1.alerts.iter().any(|a| matches!(a.severity, AlertSeverity::Error)));
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 1);
+
+        // Second cycle: should increment counter but not halt
+        let result2 = orchestrator.check_all(&positions, equity, low_margin);
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 2);
+
+        // Third cycle: should trigger circuit breaker and halt
+        let result3 = orchestrator.check_all(&positions, equity, low_margin);
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 3);
+        assert!(result3.should_halt);
+
+        // Verify circuit breaker alert was added
+        let has_circuit_breaker_alert = result3.alerts.iter().any(|alert| {
+            matches!(&alert.alert_type, RiskAlertType::Malfunction { malfunction_type }
+                if malfunction_type.contains("Circuit breaker"))
+        });
+        assert!(has_circuit_breaker_alert);
+
+        // Test manual reset
+        orchestrator.reset_circuit_breaker();
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 0);
+    }
+
+    #[test]
+    fn test_circuit_breaker_reset_on_healthy_cycle() {
+        let config = RiskOrchestratorConfig::default();
+        let mut orchestrator = RiskOrchestrator::new(config.clone(), dec!(10000));
+
+        // Create problematic position
+        let bad_positions = vec![
+            crate::exchange::Position {
+                symbol: "BTCUSDT".to_string(),
+                position_amt: dec!(1.0),
+                entry_price: dec!(50000),
+                unrealized_profit: dec!(-1000),
+                leverage: 10,
+                notional: dec!(50000),
+                isolated_margin: Decimal::ZERO,
+                mark_price: dec!(49000),
+                liquidation_price: dec!(45000),
+                position_side: crate::exchange::PositionSide::Both,
+                margin_type: crate::exchange::MarginType::Cross,
+            },
+        ];
+
+        let low_margin = dec!(100);
+        let equity = dec!(5000);
+
+        // Generate some errors
+        orchestrator.check_all(&bad_positions, equity, low_margin);
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 1);
+
+        orchestrator.check_all(&bad_positions, equity, low_margin);
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 2);
+
+        // Now check with healthy conditions (no positions, good margin)
+        let good_positions = vec![];
+        let good_margin = dec!(10000);
+        let good_equity = dec!(10000);
+
+        let result = orchestrator.check_all(&good_positions, good_equity, good_margin);
+        // Counter should reset because no ERROR/CRITICAL alerts
+        assert_eq!(orchestrator.get_circuit_breaker_count(), 0);
+        assert!(!result.should_halt);
     }
 }
