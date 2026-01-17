@@ -81,6 +81,11 @@ pub struct RiskConfig {
     /// Delta drift percentage that triggers emergency (0.0-1.0)
     #[serde(default = "default_emergency_delta_drift")]
     pub emergency_delta_drift: Decimal,
+
+    // Circuit breaker
+    /// Maximum consecutive risk check cycles with ERROR/CRITICAL alerts before halting
+    #[serde(default = "default_max_consecutive_risk_cycles")]
+    pub max_consecutive_risk_cycles: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +214,10 @@ fn default_emergency_delta_drift() -> Decimal {
     Decimal::new(10, 2) // 0.10 (10%)
 }
 
+fn default_max_consecutive_risk_cycles() -> u32 {
+    3
+}
+
 impl Config {
     /// Load configuration from environment variables and config files.
     pub fn load() -> Result<Self> {
@@ -277,6 +286,7 @@ impl Default for Config {
                 max_errors_per_minute: default_max_errors_per_minute(),
                 max_consecutive_failures: default_max_consecutive_failures(),
                 emergency_delta_drift: default_emergency_delta_drift(),
+                max_consecutive_risk_cycles: default_max_consecutive_risk_cycles(),
             },
             pair_selection: PairSelectionConfig {
                 min_volume_24h: default_min_volume(),

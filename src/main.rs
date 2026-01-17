@@ -272,6 +272,7 @@ async fn main() -> Result<()> {
         max_errors_per_minute: config.risk.max_errors_per_minute,
         max_consecutive_failures: config.risk.max_consecutive_failures,
         emergency_delta_drift: config.risk.emergency_delta_drift,
+        max_consecutive_risk_cycles: config.risk.max_consecutive_risk_cycles,
     };
     let mut risk_orchestrator = RiskOrchestrator::new(risk_config, initial_balance);
 
