@@ -11,7 +11,7 @@ mod executor;
 mod rebalancer;
 mod scanner;
 
-pub use allocator::{CapitalAllocator, PositionAllocation};
+pub use allocator::{CapitalAllocator, PositionAllocation, PositionReduction};
 pub use executor::{EntryResult, OrderExecutor};
 pub use rebalancer::{HedgeRebalancer, RebalanceAction, RebalanceConfig, RebalanceResult};
 pub use scanner::MarketScanner;

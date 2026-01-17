@@ -588,10 +588,10 @@ mod tests {
         let snapshot = MarketSnapshot {
             timestamp,
             symbols: vec![
-                // High volume, good funding - should qualify
+                // High volume, good funding - should qualify (meets 0.1% minimum)
                 SymbolData {
                     symbol: "BTCUSDT".to_string(),
-                    funding_rate: dec!(0.0005),
+                    funding_rate: dec!(0.001), // 0.1% - meets minimum
                     price: dec!(50000),
                     volume_24h: dec!(2_000_000_000),
                     spread: dec!(0.0001),
@@ -600,16 +600,16 @@ mod tests {
                 // Low volume - should NOT qualify
                 SymbolData {
                     symbol: "LOWUSDT".to_string(),
-                    funding_rate: dec!(0.001),
+                    funding_rate: dec!(0.002),
                     price: dec!(100),
                     volume_24h: dec!(10_000_000), // Below threshold
                     spread: dec!(0.0001),
                     open_interest: dec!(500_000_000),
                 },
-                // Low funding - should NOT qualify
+                // Low funding - should NOT qualify (below 0.1% minimum)
                 SymbolData {
                     symbol: "LOWFUNDUSDT".to_string(),
-                    funding_rate: dec!(0.00001), // Below threshold
+                    funding_rate: dec!(0.0005), // 0.05% - below 0.1% threshold
                     price: dec!(100),
                     volume_24h: dec!(500_000_000),
                     spread: dec!(0.0001),
@@ -636,7 +636,7 @@ mod tests {
             symbols: vec![
                 SymbolData {
                     symbol: "BTCUSDT".to_string(),
-                    funding_rate: dec!(0.001), // High funding
+                    funding_rate: dec!(0.002), // High funding (0.2%)
                     price: dec!(50000),
                     volume_24h: dec!(2_000_000_000),
                     spread: dec!(0.0001),
@@ -644,7 +644,7 @@ mod tests {
                 },
                 SymbolData {
                     symbol: "ETHUSDT".to_string(),
-                    funding_rate: dec!(0.0005), // Lower funding
+                    funding_rate: dec!(0.001), // Lower but still qualifies (0.1%)
                     price: dec!(3000),
                     volume_24h: dec!(1_000_000_000),
                     spread: dec!(0.0001),
@@ -667,7 +667,8 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_to_qualified_pairs_base_asset() {
         let timestamp = Utc::now();
-        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+        // Use 0.001 (0.1%) to meet new minimum funding rate requirement
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.001), dec!(50000))]);
 
         let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
         let engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
@@ -684,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn test_step_updates_equity() {
         let timestamp = Utc::now();
-        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.001), dec!(50000))]);
 
         let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
         let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
@@ -704,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn test_step_at_funding_time() {
         let timestamp = make_funding_time();
-        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.001), dec!(50000))]);
 
         let loader = CsvDataLoader::from_snapshots(vec![snapshot.clone()]);
         let mut engine = BacktestEngine::new(loader, test_config(), test_backtest_config());
@@ -774,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_single_snapshot() {
         let timestamp = Utc::now();
-        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+        let snapshot = make_snapshot(timestamp, vec![("BTCUSDT", dec!(0.001), dec!(50000))]);
 
         let loader = CsvDataLoader::from_snapshots(vec![snapshot]);
 
@@ -794,7 +795,7 @@ mod tests {
     async fn test_run_with_multiple_snapshots() {
         let base_time = Utc::now();
         let snapshots = vec![
-            make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]),
+            make_snapshot(base_time, vec![("BTCUSDT", dec!(0.001), dec!(50000))]),
             make_snapshot(base_time + Duration::hours(1), vec![("BTCUSDT", dec!(0.0006), dec!(50100))]),
             make_snapshot(base_time + Duration::hours(2), vec![("BTCUSDT", dec!(0.0004), dec!(49900))]),
         ];
@@ -819,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn test_backtest_result_summary() {
         let base_time = Utc::now();
-        let snapshot = make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+        let snapshot = make_snapshot(base_time, vec![("BTCUSDT", dec!(0.001), dec!(50000))]);
 
         let loader = CsvDataLoader::from_snapshots(vec![snapshot]);
 
@@ -866,9 +867,9 @@ mod tests {
     async fn test_peak_equity_updates() {
         let base_time = Utc::now();
         let snapshots = vec![
-            make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]),
-            make_snapshot(base_time + Duration::hours(1), vec![("BTCUSDT", dec!(0.0005), dec!(50500))]),
-            make_snapshot(base_time + Duration::hours(2), vec![("BTCUSDT", dec!(0.0005), dec!(50200))]),
+            make_snapshot(base_time, vec![("BTCUSDT", dec!(0.001), dec!(50000))]),
+            make_snapshot(base_time + Duration::hours(1), vec![("BTCUSDT", dec!(0.001), dec!(50500))]),
+            make_snapshot(base_time + Duration::hours(2), vec![("BTCUSDT", dec!(0.001), dec!(50200))]),
         ];
 
         let loader = CsvDataLoader::from_snapshots(snapshots);
@@ -911,7 +912,7 @@ mod tests {
         };
 
         let base_time = Utc::now();
-        let snapshot = make_snapshot(base_time, vec![("BTCUSDT", dec!(0.0005), dec!(50000))]);
+        let snapshot = make_snapshot(base_time, vec![("BTCUSDT", dec!(0.001), dec!(50000))]);
 
         let loader = CsvDataLoader::from_snapshots(vec![snapshot]);
 

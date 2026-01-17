@@ -2,13 +2,30 @@
 
 use crate::config::BinanceConfig;
 use crate::exchange::types::*;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, instrument};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::sleep;
+use tracing::{debug, instrument, warn};
+
+/// Default retry configuration
+const MAX_RETRIES: u32 = 3;
+const INITIAL_BACKOFF_MS: u64 = 100;
+const BACKOFF_MULTIPLIER: u64 = 5; // 100ms -> 500ms -> 2500ms
+
+/// Check if an HTTP status code is retryable
+fn is_retryable_status(status: StatusCode) -> bool {
+    // Retry on server errors (5xx) and rate limiting (429)
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Check if an error is retryable (network errors, timeouts)
+fn is_retryable_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
 
 const FUTURES_BASE_URL: &str = "https://fapi.binance.com";
 const FUTURES_TESTNET_URL: &str = "https://testnet.binancefuture.com";
@@ -66,6 +83,78 @@ impl BinanceClient {
             .as_millis() as u64
     }
 
+    /// Execute an HTTP request with retry and exponential backoff.
+    ///
+    /// Retries on:
+    /// - 5xx server errors
+    /// - 429 rate limit errors
+    /// - Network timeouts and connection errors
+    ///
+    /// Does NOT retry on:
+    /// - 4xx client errors (except 429)
+    /// - Authentication errors
+    /// - Validation errors
+    async fn retry_with_backoff<F, Fut>(&self, operation: &str, request_fn: F) -> Result<Response>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Response, reqwest::Error>>,
+    {
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            match request_fn().await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    // Success or non-retryable client error
+                    if status.is_success() || (status.is_client_error() && !is_retryable_status(status)) {
+                        return Ok(response);
+                    }
+
+                    // Retryable status code
+                    if is_retryable_status(status) && attempt < MAX_RETRIES {
+                        warn!(
+                            %operation,
+                            attempt,
+                            status = %status,
+                            backoff_ms,
+                            "Retryable HTTP status, backing off"
+                        );
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms *= BACKOFF_MULTIPLIER;
+                        last_error = Some(anyhow!("HTTP {} for {}", status, operation));
+                        continue;
+                    }
+
+                    // Non-retryable or exhausted retries
+                    return Ok(response);
+                }
+                Err(e) => {
+                    if is_retryable_error(&e) && attempt < MAX_RETRIES {
+                        warn!(
+                            %operation,
+                            attempt,
+                            error = %e,
+                            backoff_ms,
+                            "Retryable network error, backing off"
+                        );
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms *= BACKOFF_MULTIPLIER;
+                        last_error = Some(anyhow!("Network error for {}: {}", operation, e));
+                        continue;
+                    }
+
+                    // Non-retryable error or exhausted retries
+                    return Err(anyhow!("{} failed after {} attempts: {}", operation, attempt, e));
+                }
+            }
+        }
+
+        // Exhausted all retries
+        Err(last_error.unwrap_or_else(|| anyhow!("{} failed after {} retries", operation, MAX_RETRIES)))
+    }
+
     // ==================== Market Data (Public) ====================
 
     /// Get funding rates for all perpetual contracts.
@@ -73,11 +162,8 @@ impl BinanceClient {
     pub async fn get_funding_rates(&self) -> Result<Vec<FundingRate>> {
         let url = format!("{}/fapi/v1/premiumIndex", self.futures_base_url);
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch funding rates")?;
+            .retry_with_backoff("get_funding_rates", || self.http.get(&url).send())
+            .await?;
 
         response
             .json()
@@ -90,11 +176,8 @@ impl BinanceClient {
     pub async fn get_24h_tickers(&self) -> Result<Vec<Ticker24h>> {
         let url = format!("{}/fapi/v1/ticker/24hr", self.futures_base_url);
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch 24h tickers")?;
+            .retry_with_backoff("get_24h_tickers", || self.http.get(&url).send())
+            .await?;
 
         response
             .json()
@@ -107,11 +190,8 @@ impl BinanceClient {
     pub async fn get_spot_24h_tickers(&self) -> Result<Vec<Ticker24h>> {
         let url = format!("{}/api/v3/ticker/24hr", self.spot_base_url);
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch spot 24h tickers")?;
+            .retry_with_backoff("get_spot_24h_tickers", || self.http.get(&url).send())
+            .await?;
 
         response
             .json()
@@ -124,11 +204,8 @@ impl BinanceClient {
     pub async fn get_book_tickers(&self) -> Result<Vec<BookTicker>> {
         let url = format!("{}/fapi/v1/ticker/bookTicker", self.futures_base_url);
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch book tickers")?;
+            .retry_with_backoff("get_book_tickers", || self.http.get(&url).send())
+            .await?;
 
         response
             .json()
@@ -144,11 +221,8 @@ impl BinanceClient {
             self.futures_base_url, symbol
         );
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch open interest")?;
+            .retry_with_backoff("get_open_interest", || self.http.get(&url).send())
+            .await?;
 
         response
             .json()
@@ -161,11 +235,8 @@ impl BinanceClient {
     pub async fn get_futures_exchange_info(&self) -> Result<FuturesExchangeInfo> {
         let url = format!("{}/fapi/v1/exchangeInfo", self.futures_base_url);
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch futures exchange info")?;
+            .retry_with_backoff("get_futures_exchange_info", || self.http.get(&url).send())
+            .await?;
 
         response
             .json()
@@ -186,12 +257,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to fetch leverage brackets")?;
+            .retry_with_backoff("get_leverage_brackets", || {
+                self.http
+                    .get(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -214,12 +286,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to fetch account balance")?;
+            .retry_with_backoff("get_account_balance", || {
+                self.http
+                    .get(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -240,12 +313,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to fetch positions")?;
+            .retry_with_backoff("get_positions", || {
+                self.http
+                    .get(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -310,12 +384,13 @@ impl BinanceClient {
         debug!("Placing futures order: {:?}", order);
 
         let response = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to place futures order")?;
+            .retry_with_backoff("place_futures_order", || {
+                self.http
+                    .post(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -339,12 +414,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .delete(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to cancel futures order")?;
+            .retry_with_backoff("cancel_futures_order", || {
+                self.http
+                    .delete(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -367,12 +443,13 @@ impl BinanceClient {
             self.futures_base_url, query, signature
         );
 
-        self.http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to set leverage")?;
+        self.retry_with_backoff("set_leverage", || {
+            self.http
+                .post(&url)
+                .header("X-MBX-APIKEY", &self.api_key)
+                .send()
+        })
+        .await?;
 
         Ok(())
     }
@@ -397,7 +474,7 @@ impl BinanceClient {
         );
 
         // This endpoint returns an error if margin type is already set
-        // We ignore that specific error
+        // We ignore that specific error - no retry needed
         let _ = self
             .http
             .post(&url)
@@ -415,11 +492,8 @@ impl BinanceClient {
     pub async fn get_spot_exchange_info(&self) -> Result<Vec<SpotSymbolInfo>> {
         let url = format!("{}/api/v3/exchangeInfo", self.spot_base_url);
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch spot exchange info")?;
+            .retry_with_backoff("get_spot_exchange_info", || self.http.get(&url).send())
+            .await?;
 
         #[derive(Deserialize)]
         struct ExchangeInfo {
@@ -439,12 +513,13 @@ impl BinanceClient {
     pub async fn get_margin_all_assets(&self) -> Result<Vec<MarginAsset>> {
         let url = format!("{}/sapi/v1/margin/allAssets", self.spot_base_url);
         let response = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to fetch margin assets")?;
+            .retry_with_backoff("get_margin_all_assets", || {
+                self.http
+                    .get(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -465,12 +540,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to fetch cross margin account")?;
+            .retry_with_backoff("get_cross_margin_account", || {
+                self.http
+                    .get(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -491,12 +567,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to borrow asset")?;
+            .retry_with_backoff("margin_borrow", || {
+                self.http
+                    .post(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
@@ -519,12 +596,13 @@ impl BinanceClient {
         );
 
         let response = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to repay asset")?;
+            .retry_with_backoff("margin_repay", || {
+                self.http
+                    .post(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
@@ -588,12 +666,13 @@ impl BinanceClient {
         debug!("Placing margin order: {:?}", order);
 
         let response = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .context("Failed to place margin order")?;
+            .retry_with_backoff("place_margin_order", || {
+                self.http
+                    .post(&url)
+                    .header("X-MBX-APIKEY", &self.api_key)
+                    .send()
+            })
+            .await?;
 
         response
             .json()
@@ -616,11 +695,8 @@ impl BinanceClient {
         }
 
         let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch spot price")?;
+            .retry_with_backoff("get_spot_price", || self.http.get(&url).send())
+            .await?;
 
         let ticker: PriceTicker = response
             .json()

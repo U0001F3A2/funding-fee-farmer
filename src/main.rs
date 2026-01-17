@@ -12,7 +12,8 @@ use funding_fee_farmer::config::Config;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
 use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
-    MarginMonitor, PositionEntry, RiskAlertType, RiskOrchestrator, RiskOrchestratorConfig,
+    LiquidationAction, MarginHealth, MarginMonitor, PositionEntry, RiskAlertType, RiskOrchestrator,
+    RiskOrchestratorConfig,
 };
 use funding_fee_farmer::strategy::{
     CapitalAllocator, HedgeRebalancer, MarketScanner, OrderExecutor, RebalanceConfig,
@@ -265,6 +266,8 @@ async fn main() -> Result<()> {
         max_drawdown: config.risk.max_drawdown,
         min_margin_ratio: config.risk.min_margin_ratio,
         max_single_position: config.risk.max_single_position,
+        min_holding_period_hours: config.risk.min_holding_period_hours,
+        min_yield_advantage: config.risk.min_yield_advantage,
         max_unprofitable_hours: config.risk.max_unprofitable_hours,
         min_expected_yield: config.risk.min_expected_yield,
         grace_period_hours: config.risk.grace_period_hours,
@@ -481,6 +484,32 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
+                        // Pre-flight margin health check - ensure new position won't degrade margin to Orange/Red
+                        let current_total_positions: Decimal = current_positions.values().sum();
+                        let projected_health = MarginMonitor::simulate_position_entry(
+                            current_total_positions,
+                            mock_state.balance,
+                            alloc.target_size_usdt,
+                            alloc.leverage,
+                            None, // Use default 0.5% maintenance rate
+                        );
+
+                        match projected_health {
+                            MarginHealth::Orange | MarginHealth::Red => {
+                                warn!(
+                                    "⏩ [SKIP] {} - pre-flight check: projected margin health {:?} too risky",
+                                    alloc.symbol, projected_health
+                                );
+                                continue;
+                            }
+                            _ => {
+                                debug!(
+                                    "✓ [PRE-FLIGHT] {} - projected health {:?} acceptable",
+                                    alloc.symbol, projected_health
+                                );
+                            }
+                        }
+
                         info!("📈 [EXECUTE] Entering NEW position: {} (qty: {:.4})", alloc.symbol, target_qty);
 
                         // Calculate quantity - only enter new positions, not adjustments
@@ -622,6 +651,206 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 error!("❌ [EXECUTE] Error executing {}: {}", alloc.symbol, e);
+                                metrics.errors_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 4.5: Position Size Rebalancing
+            // Reduce oversized positions to free capital for better opportunities
+            // ═══════════════════════════════════════════════════════════════
+            let candidate_reductions = allocator.calculate_reductions(
+                &qualified_pairs,
+                mock_state.balance, // Use mock_state balance for consistency with allocation
+                &current_positions,
+            );
+
+            // Filter reductions based on minimum holding period and yield advantage
+            let reductions: Vec<_> = candidate_reductions
+                .into_iter()
+                .filter(|reduction| {
+                    // Check if position is within minimum holding period
+                    if let Some(tracked) = risk_orchestrator.get_tracked_position(&reduction.symbol) {
+                        let within_holding = tracked.is_within_holding_period(
+                            config.risk.min_holding_period_hours,
+                        );
+
+                        if within_holding {
+                            // Position is protected by holding period
+                            // Only allow reduction if there's a significant yield advantage elsewhere
+
+                            // Find the best alternative opportunity
+                            let best_alternative_rate = qualified_pairs
+                                .iter()
+                                .filter(|p| p.symbol != reduction.symbol)
+                                .map(|p| p.funding_rate.abs())
+                                .max()
+                                .unwrap_or(Decimal::ZERO);
+
+                            let current_rate = tracked.expected_funding_rate.abs();
+                            let yield_advantage = best_alternative_rate - current_rate;
+
+                            if yield_advantage < config.risk.min_yield_advantage {
+                                info!(
+                                    "🛡️  [PROTECT] {} within {}h holding period (opened {:.1}h ago). \
+                                     Yield advantage {:.4}% < required {:.2}%",
+                                    reduction.symbol,
+                                    config.risk.min_holding_period_hours,
+                                    tracked.hours_open(),
+                                    yield_advantage * dec!(100),
+                                    config.risk.min_yield_advantage * dec!(100)
+                                );
+                                return false; // Skip this reduction
+                            } else {
+                                info!(
+                                    "📊 [YIELD] {} has significant yield advantage ({:.4}% > {:.2}%) - allowing early reduction",
+                                    reduction.symbol,
+                                    yield_advantage * dec!(100),
+                                    config.risk.min_yield_advantage * dec!(100)
+                                );
+                            }
+                        }
+                    }
+                    true // Allow reduction
+                })
+                .collect();
+
+            if !reductions.is_empty() {
+                info!("📉 [REDUCE] {} positions need reduction", reductions.len());
+                for reduction in &reductions {
+                    info!(
+                        "   {} | Current: ${:.2} | Target: ${:.2} | Reduce: ${:.2}",
+                        reduction.symbol,
+                        reduction.current_size_usdt,
+                        reduction.target_size_usdt,
+                        reduction.reduction_usdt
+                    );
+                }
+
+                if trading_mode == TradingMode::Mock {
+                    let prices = fetch_prices(&real_client, &qualified_pairs).await;
+
+                    for reduction in &reductions {
+                        let price = prices.get(&reduction.symbol).copied().unwrap_or(dec!(50000));
+                        let reduction_qty = (reduction.reduction_usdt / price).round_dp(4);
+
+                        if reduction_qty <= Decimal::ZERO {
+                            continue;
+                        }
+
+                        // Get current position to determine direction
+                        let positions = mock_client.get_delta_neutral_positions().await;
+                        let futures_position = positions
+                            .iter()
+                            .find(|p| p.symbol == reduction.symbol)
+                            .map(|p| p.futures_qty)
+                            .unwrap_or(Decimal::ZERO);
+
+                        let is_short = futures_position < Decimal::ZERO;
+
+                        info!(
+                            "📉 [REDUCE] Reducing {} by {:.4} qty (is_short: {})",
+                            reduction.symbol, reduction_qty, is_short
+                        );
+
+                        // Close part of futures position
+                        let futures_close_side = if is_short {
+                            funding_fee_farmer::exchange::OrderSide::Buy
+                        } else {
+                            funding_fee_farmer::exchange::OrderSide::Sell
+                        };
+
+                        let futures_order = funding_fee_farmer::exchange::NewOrder {
+                            symbol: reduction.symbol.clone(),
+                            side: futures_close_side,
+                            position_side: None,
+                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                            quantity: Some(reduction_qty),
+                            price: None,
+                            time_in_force: None,
+                            reduce_only: Some(true),
+                            new_client_order_id: None,
+                        };
+
+                        match mock_client.place_futures_order(&futures_order).await {
+                            Ok(_) => {
+                                info!("✅ [REDUCE] Reduced futures position for {}", reduction.symbol);
+                            }
+                            Err(e) => {
+                                error!("❌ [REDUCE] Failed to reduce futures for {}: {}", reduction.symbol, e);
+                                metrics.errors_count += 1;
+                                continue;
+                            }
+                        }
+
+                        // Close matching spot position
+                        let spot_close_side = if is_short {
+                            funding_fee_farmer::exchange::OrderSide::Sell // Sell spot hedge
+                        } else {
+                            funding_fee_farmer::exchange::OrderSide::Buy // Buy back shorted spot
+                        };
+
+                        let side_effect = if is_short {
+                            funding_fee_farmer::exchange::SideEffectType::NoSideEffect
+                        } else {
+                            funding_fee_farmer::exchange::SideEffectType::AutoRepay
+                        };
+
+                        let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                            symbol: reduction.spot_symbol.clone(),
+                            side: spot_close_side,
+                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                            quantity: Some(reduction_qty),
+                            price: None,
+                            time_in_force: None,
+                            is_isolated: Some(false),
+                            side_effect_type: Some(side_effect),
+                        };
+
+                        match mock_client.place_margin_order(&spot_order).await {
+                            Ok(_) => {
+                                info!("✅ [REDUCE] Reduced spot position for {}", reduction.spot_symbol);
+                                metrics.rebalances_triggered += 1;
+                            }
+                            Err(e) => {
+                                warn!("⚠️  [REDUCE] Spot reduction failed for {}: {} (delta drift may occur)",
+                                    reduction.spot_symbol, e);
+                            }
+                        }
+                    }
+                } else {
+                    // LIVE TRADING: Execute reductions
+                    let prices = fetch_prices(&real_client, &qualified_pairs).await;
+                    let positions = real_client.get_positions().await.unwrap_or_default();
+
+                    for reduction in &reductions {
+                        let price = prices.get(&reduction.symbol).copied().unwrap_or(Decimal::ZERO);
+                        if price == Decimal::ZERO {
+                            warn!("Skipping reduction for {} due to missing price", reduction.symbol);
+                            continue;
+                        }
+
+                        let futures_position = positions
+                            .iter()
+                            .find(|p| p.symbol == reduction.symbol)
+                            .map(|p| p.position_amt)
+                            .unwrap_or(Decimal::ZERO);
+
+                        match executor.reduce_position(&real_client, reduction, price, futures_position).await {
+                            Ok(result) => {
+                                if result.success {
+                                    info!("✅ [REDUCE] Reduced position for {}", result.symbol);
+                                    metrics.rebalances_triggered += 1;
+                                } else {
+                                    error!("❌ [REDUCE] Failed to reduce {}: {:?}", result.symbol, result.error);
+                                    metrics.errors_count += 1;
+                                }
+                            }
+                            Err(e) => {
+                                error!("❌ [REDUCE] Error reducing {}: {}", reduction.symbol, e);
                                 metrics.errors_count += 1;
                             }
                         }
@@ -944,6 +1173,82 @@ async fn main() -> Result<()> {
                         }
                         RiskAlertType::MarginWarning { health, action } => {
                             warn!("⚠️  [RISK] Margin health: {:?} - {}", health, action);
+
+                            // Automatic position reduction for margin health warnings
+                            let reduction_pct = match health {
+                                MarginHealth::Red => Some(dec!(0.50)),    // 50% reduction for critical
+                                MarginHealth::Orange => Some(dec!(0.25)), // 25% reduction for warning
+                                _ => None,
+                            };
+
+                            if let Some(pct) = reduction_pct {
+                                info!("🤖 [AUTO-REDUCE] Executing {}% reduction for all positions due to {:?} margin health",
+                                    pct * dec!(100), health);
+
+                                for pos in &positions {
+                                    if pos.futures_qty.abs() < dec!(0.0001) {
+                                        continue;
+                                    }
+
+                                    let reduce_qty = pos.futures_qty.abs() * pct;
+
+                                    // Reduce futures
+                                    let futures_side = if pos.futures_qty > Decimal::ZERO {
+                                        funding_fee_farmer::exchange::OrderSide::Sell
+                                    } else {
+                                        funding_fee_farmer::exchange::OrderSide::Buy
+                                    };
+
+                                    let futures_order = funding_fee_farmer::exchange::NewOrder {
+                                        symbol: pos.symbol.clone(),
+                                        side: futures_side,
+                                        position_side: None,
+                                        order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                        quantity: Some(reduce_qty),
+                                        price: None,
+                                        time_in_force: None,
+                                        reduce_only: Some(true),
+                                        new_client_order_id: None,
+                                    };
+
+                                    match mock_client.place_futures_order(&futures_order).await {
+                                        Ok(_) => {
+                                            info!("✅ [AUTO-REDUCE] Reduced futures {} by {}%", pos.symbol, pct * dec!(100));
+                                            metrics.rebalances_triggered += 1;
+                                        }
+                                        Err(e) => {
+                                            error!("❌ [AUTO-REDUCE] Futures reduction failed for {}: {}", pos.symbol, e);
+                                            metrics.errors_count += 1;
+                                        }
+                                    }
+
+                                    // Reduce spot
+                                    if pos.spot_qty.abs() >= dec!(0.0001) {
+                                        let spot_side = if pos.spot_qty > Decimal::ZERO {
+                                            funding_fee_farmer::exchange::OrderSide::Sell
+                                        } else {
+                                            funding_fee_farmer::exchange::OrderSide::Buy
+                                        };
+
+                                        let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                                            symbol: pos.spot_symbol.clone(),
+                                            side: spot_side,
+                                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                            quantity: Some(pos.spot_qty.abs() * pct),
+                                            price: None,
+                                            time_in_force: None,
+                                            is_isolated: Some(false),
+                                            side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
+                                        };
+
+                                        if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                                            error!("❌ [AUTO-REDUCE] Spot reduction failed for {}: {}", pos.spot_symbol, e);
+                                        } else {
+                                            info!("✅ [AUTO-REDUCE] Reduced spot {} by {}%", pos.spot_symbol, pct * dec!(100));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         RiskAlertType::PositionLoss { symbol, reason, hours } => {
                             warn!(
@@ -963,6 +1268,81 @@ async fn main() -> Result<()> {
                         }
                         RiskAlertType::LiquidationRisk { action } => {
                             error!("🚨 [RISK] Liquidation risk! Action: {:?}", action);
+
+                            // Automatic position reduction for liquidation risk
+                            match action {
+                                LiquidationAction::ReducePosition { symbol, reduction_pct } => {
+                                    info!("🤖 [AUTO-REDUCE] Executing {}% reduction for {}", reduction_pct * dec!(100), symbol);
+
+                                    if let Some(pos) = positions.iter().find(|p| &p.symbol == symbol) {
+                                        let reduce_qty = pos.futures_qty.abs() * *reduction_pct;
+
+                                        if reduce_qty >= dec!(0.0001) {
+                                            // Close portion of futures
+                                            let futures_side = if pos.futures_qty > Decimal::ZERO {
+                                                funding_fee_farmer::exchange::OrderSide::Sell
+                                            } else {
+                                                funding_fee_farmer::exchange::OrderSide::Buy
+                                            };
+
+                                            let futures_order = funding_fee_farmer::exchange::NewOrder {
+                                                symbol: symbol.clone(),
+                                                side: futures_side,
+                                                position_side: None,
+                                                order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                                quantity: Some(reduce_qty),
+                                                price: None,
+                                                time_in_force: None,
+                                                reduce_only: Some(true),
+                                                new_client_order_id: None,
+                                            };
+
+                                            match mock_client.place_futures_order(&futures_order).await {
+                                                Ok(_) => {
+                                                    info!("✅ [AUTO-REDUCE] Reduced futures {} by {}%", symbol, reduction_pct * dec!(100));
+                                                    metrics.rebalances_triggered += 1;
+                                                }
+                                                Err(e) => {
+                                                    error!("❌ [AUTO-REDUCE] Futures reduction failed for {}: {}", symbol, e);
+                                                    metrics.errors_count += 1;
+                                                }
+                                            }
+
+                                            // Close matching spot position
+                                            let spot_reduce_qty = pos.spot_qty.abs() * *reduction_pct;
+                                            if spot_reduce_qty >= dec!(0.0001) {
+                                                let spot_side = if pos.spot_qty > Decimal::ZERO {
+                                                    funding_fee_farmer::exchange::OrderSide::Sell
+                                                } else {
+                                                    funding_fee_farmer::exchange::OrderSide::Buy
+                                                };
+
+                                                let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                                                    symbol: pos.spot_symbol.clone(),
+                                                    side: spot_side,
+                                                    order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                                    quantity: Some(spot_reduce_qty),
+                                                    price: None,
+                                                    time_in_force: None,
+                                                    is_isolated: Some(false),
+                                                    side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
+                                                };
+
+                                                if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                                                    error!("❌ [AUTO-REDUCE] Spot reduction failed for {}: {}", pos.spot_symbol, e);
+                                                } else {
+                                                    info!("✅ [AUTO-REDUCE] Reduced spot {} by {}%", pos.spot_symbol, reduction_pct * dec!(100));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                LiquidationAction::ClosePosition { symbol } => {
+                                    warn!("🤖 [AUTO-CLOSE] Position {} flagged for emergency close", symbol);
+                                    // This will be handled by positions_to_close below
+                                }
+                                _ => {}
+                            }
                         }
                         RiskAlertType::DeltaDrift { symbol, drift_pct } => {
                             warn!(

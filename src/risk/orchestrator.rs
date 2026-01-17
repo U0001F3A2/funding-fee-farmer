@@ -37,6 +37,10 @@ pub struct RiskOrchestratorConfig {
     pub min_margin_ratio: Decimal,
     pub max_single_position: Decimal,
 
+    // Position holding rules
+    pub min_holding_period_hours: u32,
+    pub min_yield_advantage: Decimal,
+
     // Position loss detection
     pub max_unprofitable_hours: u32,
     pub min_expected_yield: Decimal,
@@ -58,6 +62,8 @@ impl Default for RiskOrchestratorConfig {
             max_drawdown: dec!(0.05),
             min_margin_ratio: dec!(3.0),
             max_single_position: dec!(0.30),
+            min_holding_period_hours: 24,
+            min_yield_advantage: dec!(0.05),
             max_unprofitable_hours: 48,
             min_expected_yield: dec!(0.10),
             grace_period_hours: 8,
@@ -232,6 +238,8 @@ impl RiskOrchestrator {
             max_drawdown: config.max_drawdown,
             min_margin_ratio: config.min_margin_ratio,
             max_single_position: config.max_single_position,
+            min_holding_period_hours: config.min_holding_period_hours,
+            min_yield_advantage: config.min_yield_advantage,
             max_unprofitable_hours: config.max_unprofitable_hours,
             min_expected_yield: config.min_expected_yield,
             grace_period_hours: config.grace_period_hours,

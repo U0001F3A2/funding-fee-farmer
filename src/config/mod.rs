@@ -43,6 +43,10 @@ pub struct CapitalConfig {
     /// Minimum position size in USDT
     #[serde(default = "default_min_position_size")]
     pub min_position_size: Decimal,
+    /// Rebalance threshold - reduce positions when current > target * (1 + threshold)
+    /// Default 0.2 = 20% drift triggers reduction
+    #[serde(default = "default_rebalance_threshold")]
+    pub rebalance_threshold: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +60,14 @@ pub struct RiskConfig {
     /// Maximum allocation to a single position (0.0-1.0)
     #[serde(default = "default_max_single_position")]
     pub max_single_position: Decimal,
+
+    // Position holding rules
+    /// Minimum hours to hold a position before considering exit (to cover trading fees)
+    #[serde(default = "default_min_holding_period_hours")]
+    pub min_holding_period_hours: u32,
+    /// Minimum yield advantage (in %) for new position to justify switching (e.g., 0.05 = 5%)
+    #[serde(default = "default_min_yield_advantage")]
+    pub min_yield_advantage: Decimal,
 
     // Position loss detection
     /// Maximum hours to keep an unprofitable position
@@ -105,6 +117,9 @@ pub struct PairSelectionConfig {
     /// Maximum number of concurrent positions (concentrate capital)
     #[serde(default = "default_max_positions")]
     pub max_positions: u8,
+    /// Default daily borrow rate for assets with missing margin data
+    #[serde(default = "default_borrow_rate")]
+    pub default_borrow_rate: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +151,10 @@ fn default_min_position_size() -> Decimal {
     Decimal::new(1000, 0) // 1000 USDT
 }
 
+fn default_rebalance_threshold() -> Decimal {
+    Decimal::new(20, 2) // 0.20 = 20% drift triggers reduction
+}
+
 fn default_max_drawdown() -> Decimal {
     Decimal::new(5, 2) // 0.05
 }
@@ -153,7 +172,7 @@ fn default_min_volume() -> Decimal {
 }
 
 fn default_min_funding_rate() -> Decimal {
-    Decimal::new(5, 4) // 0.0005 (0.05%) - focus on high-yield pairs
+    Decimal::new(1, 3) // 0.001 (0.1%) - minimum to justify trading fees with 24h hold
 }
 
 fn default_max_spread() -> Decimal {
@@ -166,6 +185,10 @@ fn default_min_open_interest() -> Decimal {
 
 fn default_max_positions() -> u8 {
     5 // Concentrate capital into top pairs
+}
+
+fn default_borrow_rate() -> Decimal {
+    Decimal::new(1, 3) // 0.001 (0.1% daily) - conservative fallback for unknown assets
 }
 
 fn default_leverage() -> u8 {
@@ -182,6 +205,15 @@ fn default_slippage_tolerance() -> Decimal {
 
 fn default_order_timeout() -> u64 {
     30
+}
+
+// Position holding rules defaults
+fn default_min_holding_period_hours() -> u32 {
+    24 // Minimum 24h hold to ensure funding fees exceed trading costs
+}
+
+fn default_min_yield_advantage() -> Decimal {
+    Decimal::new(5, 2) // 0.05 (5%) - new position must yield 5%+ more to justify switch
 }
 
 // Position loss detection defaults
@@ -274,11 +306,14 @@ impl Default for Config {
                 max_utilization: default_max_utilization(),
                 reserve_buffer: default_reserve_buffer(),
                 min_position_size: default_min_position_size(),
+                rebalance_threshold: default_rebalance_threshold(),
             },
             risk: RiskConfig {
                 max_drawdown: default_max_drawdown(),
                 min_margin_ratio: default_min_margin_ratio(),
                 max_single_position: default_max_single_position(),
+                min_holding_period_hours: default_min_holding_period_hours(),
+                min_yield_advantage: default_min_yield_advantage(),
                 max_unprofitable_hours: default_max_unprofitable_hours(),
                 min_expected_yield: default_min_expected_yield(),
                 grace_period_hours: default_grace_period_hours(),
@@ -294,6 +329,7 @@ impl Default for Config {
                 max_spread: default_max_spread(),
                 min_open_interest: default_min_open_interest(),
                 max_positions: default_max_positions(),
+                default_borrow_rate: default_borrow_rate(),
             },
             execution: ExecutionConfig {
                 default_leverage: default_leverage(),

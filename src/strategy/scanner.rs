@@ -6,11 +6,32 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 /// Scans the market for profitable funding rate opportunities.
 pub struct MarketScanner {
     config: PairSelectionConfig,
+}
+
+/// Get fallback borrow rate for an asset when margin data is unavailable.
+///
+/// Rates are based on typical borrow rates observed on Binance:
+/// - Tier 1 (BTC, ETH): Lower rates due to high liquidity
+/// - Tier 2 (Major alts): Medium rates
+/// - Tier 3 (Other): Use config default (conservative)
+fn get_fallback_borrow_rate(asset: &str, config_default: Decimal) -> Decimal {
+    match asset.to_uppercase().as_str() {
+        // Tier 1: Major crypto - typically lowest rates (0.02-0.05% daily)
+        "BTC" | "ETH" => dec!(0.0003), // 0.03% daily
+        // Tier 2: Large caps - moderate rates (0.05-0.1% daily)
+        "BNB" | "SOL" | "XRP" | "ADA" | "DOGE" | "AVAX" | "DOT" | "LINK" | "MATIC" => {
+            dec!(0.0007)
+        } // 0.07% daily
+        // Tier 3: Stablecoins - very low rates
+        "USDT" | "USDC" | "BUSD" | "DAI" | "TUSD" => dec!(0.0001), // 0.01% daily
+        // Tier 4: All others - use conservative config default
+        _ => config_default,
+    }
 }
 
 impl MarketScanner {
@@ -101,7 +122,14 @@ impl MarketScanner {
         // Sort by score (descending) - pairs with higher net profitability first
         qualified.sort_by(|a, b| b.score.cmp(&a.score));
 
-        info!(qualified_count = qualified.len(), "Pairs qualified with margin support");
+        let total_scanned = funding_rates.len();
+        let rejected_count = total_scanned - qualified.len();
+        info!(
+            total_scanned,
+            qualified_count = qualified.len(),
+            rejected_count,
+            "Market scan complete"
+        );
 
         Ok(qualified)
     }
@@ -140,7 +168,7 @@ impl MarketScanner {
             .unwrap_or(false);
 
         if !margin_available {
-            debug!(symbol, "No spot margin trading available - cannot hedge");
+            trace!(symbol, "No spot margin trading available - cannot hedge");
             return None;
         }
 
@@ -157,21 +185,21 @@ impl MarketScanner {
         // Get volume
         let volume = *volume_map.get(symbol)?;
         if volume < self.config.min_volume_24h {
-            debug!(symbol, %volume, "Volume below threshold");
+            trace!(symbol, %volume, "Volume below threshold");
             return None;
         }
 
         // Get spread
         let spread = *spread_map.get(symbol)?;
         if spread > self.config.max_spread {
-            debug!(symbol, %spread, "Spread above threshold");
+            trace!(symbol, %spread, "Spread above threshold");
             return None;
         }
 
         // Check funding rate magnitude
         let funding_rate_abs = funding.funding_rate.abs();
         if funding_rate_abs < self.config.min_funding_rate {
-            debug!(symbol, %funding_rate_abs, "Funding rate below threshold");
+            trace!(symbol, %funding_rate_abs, "Funding rate below threshold");
             return None;
         }
 
@@ -181,7 +209,17 @@ impl MarketScanner {
         let borrow_cost_per_8h = if funding.funding_rate < Decimal::ZERO {
             // Need to short spot, calculate borrow cost
             // Daily rate / 3 = 8-hour rate (funding settlement period)
-            borrow_rate.unwrap_or(dec!(0.001)) / dec!(3)
+            let daily_rate = borrow_rate.unwrap_or_else(|| {
+                let fallback = get_fallback_borrow_rate(&base_asset, self.config.default_borrow_rate);
+                debug!(
+                    symbol,
+                    %base_asset,
+                    %fallback,
+                    "Using fallback borrow rate (margin data unavailable)"
+                );
+                fallback
+            });
+            daily_rate / dec!(3)
         } else {
             Decimal::ZERO
         };
@@ -200,7 +238,7 @@ impl MarketScanner {
             + spread_score * dec!(0.2)
             + margin_safety * dec!(0.05);
 
-        debug!(
+        trace!(
             symbol,
             %funding.funding_rate,
             %net_funding,
@@ -276,6 +314,7 @@ mod tests {
             max_spread: dec!(0.0002),
             min_open_interest: dec!(50_000_000),
             max_positions: 5,
+            default_borrow_rate: dec!(0.001), // 0.1% daily fallback
         }
     }
 
@@ -700,5 +739,72 @@ mod tests {
         assert!(pair.margin_available);
         assert!(pair.borrow_rate.is_some());
         assert!(pair.score > Decimal::ZERO);
+    }
+
+    // =========================================================================
+    // Fallback Borrow Rate Tests
+    // =========================================================================
+
+    #[test]
+    fn test_fallback_borrow_rate_tier1_btc() {
+        let config_default = dec!(0.001);
+        let rate = super::get_fallback_borrow_rate("BTC", config_default);
+        assert_eq!(rate, dec!(0.0003), "BTC should use tier 1 rate (0.03% daily)");
+    }
+
+    #[test]
+    fn test_fallback_borrow_rate_tier1_eth() {
+        let config_default = dec!(0.001);
+        let rate = super::get_fallback_borrow_rate("ETH", config_default);
+        assert_eq!(rate, dec!(0.0003), "ETH should use tier 1 rate (0.03% daily)");
+    }
+
+    #[test]
+    fn test_fallback_borrow_rate_tier2_sol() {
+        let config_default = dec!(0.001);
+        let rate = super::get_fallback_borrow_rate("SOL", config_default);
+        assert_eq!(rate, dec!(0.0007), "SOL should use tier 2 rate (0.07% daily)");
+    }
+
+    #[test]
+    fn test_fallback_borrow_rate_tier2_bnb() {
+        let config_default = dec!(0.001);
+        let rate = super::get_fallback_borrow_rate("BNB", config_default);
+        assert_eq!(rate, dec!(0.0007), "BNB should use tier 2 rate (0.07% daily)");
+    }
+
+    #[test]
+    fn test_fallback_borrow_rate_stablecoins() {
+        let config_default = dec!(0.001);
+        assert_eq!(
+            super::get_fallback_borrow_rate("USDT", config_default),
+            dec!(0.0001),
+            "USDT should use stablecoin rate (0.01% daily)"
+        );
+        assert_eq!(
+            super::get_fallback_borrow_rate("USDC", config_default),
+            dec!(0.0001),
+            "USDC should use stablecoin rate"
+        );
+    }
+
+    #[test]
+    fn test_fallback_borrow_rate_unknown_asset() {
+        let config_default = dec!(0.0015);
+        let rate = super::get_fallback_borrow_rate("OBSCURECOIN", config_default);
+        assert_eq!(
+            rate, config_default,
+            "Unknown asset should use config default"
+        );
+    }
+
+    #[test]
+    fn test_fallback_borrow_rate_case_insensitive() {
+        let config_default = dec!(0.001);
+        assert_eq!(
+            super::get_fallback_borrow_rate("btc", config_default),
+            super::get_fallback_borrow_rate("BTC", config_default),
+            "Asset lookup should be case insensitive"
+        );
     }
 }

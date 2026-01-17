@@ -5,7 +5,7 @@ use crate::exchange::{
     BinanceClient, MarginOrder, MarginType, NewOrder, OrderResponse, OrderSide, OrderStatus,
     OrderType, SideEffectType, TimeInForce,
 };
-use crate::strategy::allocator::PositionAllocation;
+use crate::strategy::allocator::{PositionAllocation, PositionReduction};
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -303,6 +303,135 @@ impl OrderExecutor {
 
         self.place_order_with_retry(client, symbol, side, OrderType::Market, quantity, None, 3)
             .await
+    }
+
+    /// Reduce an oversized position to maintain optimal allocation.
+    ///
+    /// This reduces both the futures and spot positions proportionally to maintain
+    /// delta neutrality while freeing up capital for better opportunities.
+    pub async fn reduce_position(
+        &self,
+        client: &BinanceClient,
+        reduction: &PositionReduction,
+        current_price: Decimal,
+        futures_position: Decimal, // Current futures position (positive=long, negative=short)
+    ) -> Result<EntryResult> {
+        let symbol = &reduction.symbol;
+        let spot_symbol = &reduction.spot_symbol;
+
+        // Calculate reduction quantity
+        let reduction_quantity = reduction.reduction_usdt / current_price;
+        let reduction_quantity = self.round_quantity(reduction_quantity, symbol);
+
+        if reduction_quantity <= Decimal::ZERO {
+            return Ok(EntryResult {
+                symbol: symbol.clone(),
+                spot_order: None,
+                futures_order: None,
+                success: true,
+                error: Some("Reduction quantity too small".to_string()),
+            });
+        }
+
+        info!(
+            %symbol,
+            current_size = %reduction.current_size_usdt,
+            target_size = %reduction.target_size_usdt,
+            reduction = %reduction.reduction_usdt,
+            %reduction_quantity,
+            "Reducing oversized position"
+        );
+
+        // Determine the direction of reduction based on current futures position
+        // If futures is short (negative), we close part of short (buy) and sell spot
+        // If futures is long (positive), we close part of long (sell) and buy back spot/repay
+        let is_short_futures = futures_position < Decimal::ZERO;
+
+        // Step 1: Reduce futures position
+        let futures_side = if is_short_futures {
+            OrderSide::Buy // Close short
+        } else {
+            OrderSide::Sell // Close long
+        };
+
+        let futures_result = self
+            .place_futures_order_with_retry(client, symbol, futures_side, reduction_quantity, 3)
+            .await;
+
+        let futures_order = match futures_result {
+            Ok(order) => Some(order),
+            Err(e) => {
+                error!(%symbol, error = %e, "Failed to reduce futures position");
+                return Ok(EntryResult {
+                    symbol: symbol.clone(),
+                    spot_order: None,
+                    futures_order: None,
+                    success: false,
+                    error: Some(format!("Futures reduction failed: {}", e)),
+                });
+            }
+        };
+
+        // Step 2: Reduce spot position (opposite side of futures)
+        let spot_side = if is_short_futures {
+            // Was long spot to hedge short futures, sell spot
+            OrderSide::Sell
+        } else {
+            // Was short spot (margin) to hedge long futures, buy to repay
+            OrderSide::Buy
+        };
+
+        let side_effect = if is_short_futures {
+            // Selling spot normally
+            SideEffectType::NoSideEffect
+        } else {
+            // Buying to repay margin borrow
+            SideEffectType::AutoRepay
+        };
+
+        let spot_order = MarginOrder {
+            symbol: spot_symbol.clone(),
+            side: spot_side,
+            order_type: OrderType::Market,
+            quantity: Some(reduction_quantity),
+            price: None,
+            time_in_force: None,
+            is_isolated: Some(false),
+            side_effect_type: Some(side_effect),
+        };
+
+        let spot_result = client.place_margin_order(&spot_order).await;
+
+        let spot_order_response = match spot_result {
+            Ok(order) => Some(order),
+            Err(e) => {
+                // Log warning but don't fail - futures already reduced
+                warn!(
+                    %symbol,
+                    error = %e,
+                    "Spot reduction failed - position may have delta drift"
+                );
+                None
+            }
+        };
+
+        let success = futures_order.is_some();
+
+        info!(
+            %symbol,
+            futures_success = futures_order.is_some(),
+            spot_success = spot_order_response.is_some(),
+            %reduction_quantity,
+            "Position reduction complete"
+        );
+
+        Ok(EntryResult {
+            symbol: symbol.clone(),
+            spot_order: spot_order_response,
+            futures_order,
+            success,
+            error: None,
+        })
     }
 
     /// Prepare futures symbol (set leverage and margin type).

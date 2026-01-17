@@ -138,6 +138,44 @@ impl TrackedPosition {
         let hours_open = (Utc::now() - self.opened_at).num_hours();
         hours_open < grace_hours as i64
     }
+
+    /// Check if position is currently profitable (net PnL > 0).
+    pub fn is_profitable(&self) -> bool {
+        self.net_pnl() > Decimal::ZERO
+    }
+
+    /// Calculate hours open.
+    pub fn hours_open(&self) -> f64 {
+        let duration = Utc::now() - self.opened_at;
+        duration.num_seconds() as f64 / 3600.0
+    }
+
+    /// Check if position is within the minimum holding period.
+    /// During this period, positions should not be exited voluntarily
+    /// (to ensure funding fees cover trading costs).
+    pub fn is_within_holding_period(&self, min_holding_hours: u32) -> bool {
+        self.hours_open() < min_holding_hours as f64
+    }
+
+    /// Calculate estimated time to break-even based on current funding rate.
+    /// Returns None if already profitable or funding rate is zero/negative.
+    pub fn estimated_breakeven_hours(&self) -> Option<Decimal> {
+        let net = self.net_pnl();
+        if net >= Decimal::ZERO {
+            return Some(Decimal::ZERO); // Already profitable
+        }
+
+        // Calculate hourly funding income
+        // funding_rate is per 8 hours, so hourly = rate / 8
+        let hourly_funding = (self.expected_funding_rate.abs() * self.position_value) / dec!(8);
+
+        if hourly_funding <= Decimal::ZERO {
+            return None; // Won't reach breakeven
+        }
+
+        // Hours needed = remaining loss / hourly income
+        Some(net.abs() / hourly_funding)
+    }
 }
 
 /// Actions the position tracker can recommend.
@@ -276,6 +314,34 @@ impl PositionTracker {
         }
 
         let net_pnl = pos.net_pnl();
+        let total_costs = pos.total_costs();
+        let is_profitable = pos.is_profitable();
+        let breakeven_hours = pos.estimated_breakeven_hours();
+
+        // Log net profitability metrics
+        debug!(
+            %symbol,
+            net_pnl = %net_pnl,
+            funding_received = %pos.total_funding_received,
+            interest_paid = %pos.interest_paid,
+            total_costs = %total_costs,
+            is_profitable = is_profitable,
+            hours_open = pos.hours_open,
+            breakeven_hours = ?breakeven_hours,
+            "Position profitability check"
+        );
+
+        // Alert for long-term unprofitable positions (>24 hours and still losing money)
+        if !is_profitable && pos.hours_open > 24.0 {
+            warn!(
+                %symbol,
+                hours_open = pos.hours_open,
+                %net_pnl,
+                %total_costs,
+                funding_received = %pos.total_funding_received,
+                "⚠️  Position unprofitable after 24+ hours - review required"
+            );
+        }
         let annualized = pos.annualized_yield();
 
         // Check if position is unprofitable

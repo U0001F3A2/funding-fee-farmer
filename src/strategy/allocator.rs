@@ -26,6 +26,25 @@ pub struct PositionAllocation {
     pub priority: u8,
 }
 
+/// Position reduction target for rebalancing.
+#[derive(Debug, Clone)]
+pub struct PositionReduction {
+    /// Futures symbol (e.g., "BTCUSDT")
+    pub symbol: String,
+    /// Corresponding spot symbol
+    pub spot_symbol: String,
+    /// Base asset (e.g., "BTC")
+    pub base_asset: String,
+    /// Current position size in USDT
+    pub current_size_usdt: Decimal,
+    /// Target position size in USDT
+    pub target_size_usdt: Decimal,
+    /// Amount to reduce in USDT
+    pub reduction_usdt: Decimal,
+    /// Current funding rate
+    pub funding_rate: Decimal,
+}
+
 /// Manages capital allocation across multiple positions.
 pub struct CapitalAllocator {
     capital_config: CapitalConfig,
@@ -66,12 +85,35 @@ impl CapitalAllocator {
             total_equity * self.capital_config.max_utilization;
         let max_per_position =
             total_equity * self.risk_config.max_single_position;
+        let leverage = Decimal::from(self.default_leverage);
+
+        // === Margin Budget Tracking ===
+        // Calculate margin currently locked by existing positions
+        let current_positions_total: Decimal = current_positions.values().map(|v| v.abs()).sum();
+        let current_margin_locked = current_positions_total / leverage;
+
+        // Available margin = Total equity minus locked margin, respecting reserve buffer
+        let reserve_amount = total_equity * self.capital_config.reserve_buffer;
+        let margin_budget = (total_equity - current_margin_locked - reserve_amount).max(Decimal::ZERO);
+
+        // Track margin consumption as we allocate
+        let mut margin_consumed = Decimal::ZERO;
+
+        // Calculate margin headroom metrics
+        let margin_utilization_pct = if total_equity > Decimal::ZERO {
+            (current_margin_locked / total_equity) * dec!(100)
+        } else {
+            Decimal::ZERO
+        };
 
         debug!(
             %total_equity,
             %deployable_capital,
             %max_per_position,
-            "Calculating allocation"
+            %current_margin_locked,
+            %margin_budget,
+            %margin_utilization_pct,
+            "Calculating allocation with margin constraints"
         );
 
         let mut allocations = Vec::new();
@@ -80,6 +122,13 @@ impl CapitalAllocator {
         for (idx, pair) in pairs.iter().enumerate() {
             // Stop if we've allocated enough capital
             if allocated >= deployable_capital {
+                debug!("Stopping allocation: capital budget exhausted");
+                break;
+            }
+
+            // Stop if margin budget exhausted
+            if margin_consumed >= margin_budget {
+                debug!(%margin_consumed, %margin_budget, "Stopping allocation: margin budget exhausted");
                 break;
             }
 
@@ -92,6 +141,22 @@ impl CapitalAllocator {
 
             // Skip if target is below minimum
             if target_size < self.capital_config.min_position_size {
+                continue;
+            }
+
+            // Check margin required for this allocation
+            // margin_required = position_value / (leverage * min_margin_ratio)
+            // This ensures we maintain minimum margin ratio for safety
+            let margin_required = target_size / (leverage * self.risk_config.min_margin_ratio);
+
+            // Check if we have enough margin budget
+            if margin_consumed + margin_required > margin_budget {
+                debug!(
+                    symbol = %pair.symbol,
+                    %margin_required,
+                    remaining_budget = %(margin_budget - margin_consumed),
+                    "Skipping allocation: insufficient margin budget"
+                );
                 continue;
             }
 
@@ -114,6 +179,11 @@ impl CapitalAllocator {
                 continue;
             }
 
+            // Track margin consumption for new positions only
+            if current == Decimal::ZERO {
+                margin_consumed += margin_required;
+            }
+
             allocations.push(PositionAllocation {
                 symbol: pair.symbol.clone(),
                 spot_symbol: pair.spot_symbol.clone(),
@@ -128,6 +198,109 @@ impl CapitalAllocator {
         }
 
         allocations
+    }
+
+    /// Calculate position reductions for oversized positions.
+    ///
+    /// Positions exceeding target * (1 + rebalance_threshold) are marked for reduction.
+    /// This allows capital to flow to better opportunities when allocations change.
+    ///
+    /// # Arguments
+    /// * `pairs` - Qualified pairs with current allocation targets
+    /// * `total_equity` - Total account equity in USDT
+    /// * `current_positions` - Map of symbol to current position size (USDT)
+    ///
+    /// # Returns
+    /// Vector of position reductions needed
+    pub fn calculate_reductions(
+        &self,
+        pairs: &[QualifiedPair],
+        total_equity: Decimal,
+        current_positions: &HashMap<String, Decimal>,
+    ) -> Vec<PositionReduction> {
+        let deployable_capital = total_equity * self.capital_config.max_utilization;
+        let max_per_position = total_equity * self.risk_config.max_single_position;
+        let threshold = self.capital_config.rebalance_threshold;
+
+        let mut reductions = Vec::new();
+        let mut remaining_capital = deployable_capital;
+
+        // Build target sizes for qualified pairs
+        for (idx, pair) in pairs.iter().enumerate() {
+            if remaining_capital <= Decimal::ZERO {
+                break;
+            }
+
+            let score_weight = self.score_to_weight(pair.score, idx);
+            let target_size = (remaining_capital * score_weight)
+                .min(max_per_position)
+                .max(self.capital_config.min_position_size);
+
+            let current = current_positions
+                .get(&pair.symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .abs();
+
+            // Check if position exceeds target by more than threshold
+            let max_acceptable = target_size * (Decimal::ONE + threshold);
+
+            if current > max_acceptable && current > self.capital_config.min_position_size {
+                let reduction = current - target_size;
+                debug!(
+                    symbol = %pair.symbol,
+                    %current,
+                    %target_size,
+                    %reduction,
+                    "Position oversized - reduction needed"
+                );
+
+                reductions.push(PositionReduction {
+                    symbol: pair.symbol.clone(),
+                    spot_symbol: pair.spot_symbol.clone(),
+                    base_asset: pair.base_asset.clone(),
+                    current_size_usdt: current,
+                    target_size_usdt: target_size,
+                    reduction_usdt: reduction,
+                    funding_rate: pair.funding_rate,
+                });
+            }
+
+            remaining_capital -= target_size.min(current);
+        }
+
+        // Also check for positions not in qualified pairs (orphaned positions)
+        for (symbol, &current) in current_positions {
+            let current = current.abs();
+            if current < self.capital_config.min_position_size {
+                continue;
+            }
+
+            let is_qualified = pairs.iter().any(|p| &p.symbol == symbol);
+            if !is_qualified {
+                // Position is no longer in qualified pairs - should be reduced to zero
+                debug!(
+                    %symbol,
+                    %current,
+                    "Orphaned position - not in qualified pairs"
+                );
+
+                // Extract base asset from symbol (e.g., "BTCUSDT" -> "BTC")
+                let base_asset = symbol.strip_suffix("USDT").unwrap_or(symbol).to_string();
+
+                reductions.push(PositionReduction {
+                    symbol: symbol.clone(),
+                    spot_symbol: symbol.clone(),
+                    base_asset,
+                    current_size_usdt: current,
+                    target_size_usdt: Decimal::ZERO,
+                    reduction_usdt: current,
+                    funding_rate: Decimal::ZERO, // Unknown for orphaned positions
+                });
+            }
+        }
+
+        reductions
     }
 
     /// Convert pair score to allocation weight.
@@ -175,11 +348,14 @@ mod tests {
                 max_utilization: dec!(0.85),
                 reserve_buffer: dec!(0.10),
                 min_position_size: dec!(1000),
+                rebalance_threshold: dec!(0.20),
             },
             RiskConfig {
                 max_drawdown: dec!(0.05),
                 min_margin_ratio: dec!(3),
                 max_single_position: dec!(0.30),
+                min_holding_period_hours: 24,
+                min_yield_advantage: dec!(0.05),
                 max_unprofitable_hours: 48,
                 min_expected_yield: dec!(0.10),
                 grace_period_hours: 8,

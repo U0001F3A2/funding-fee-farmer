@@ -252,6 +252,65 @@ impl MarginMonitor {
         let target_position = position_margin / (target_ratio * maintenance_margin_rate);
         (position_value - target_position).max(Decimal::ZERO)
     }
+
+    /// Simulate the margin health after entering a new position.
+    ///
+    /// This helps validate that a proposed allocation won't immediately trigger
+    /// risk alerts by projecting what the margin health will be after entry.
+    ///
+    /// # Arguments
+    /// * `current_positions_value` - Total notional value of current positions
+    /// * `total_margin` - Total margin available
+    /// * `new_allocation_value` - Notional value of the new position to enter
+    /// * `leverage` - Leverage being used for the new position
+    /// * `maintenance_rate` - Estimated maintenance margin rate (default ~0.5%)
+    ///
+    /// # Returns
+    /// Projected margin health after entry
+    pub fn simulate_position_entry(
+        current_positions_value: Decimal,
+        total_margin: Decimal,
+        new_allocation_value: Decimal,
+        leverage: u8,
+        maintenance_rate: Option<Decimal>,
+    ) -> MarginHealth {
+        // Default maintenance rate of 0.5% is conservative
+        let maint_rate = maintenance_rate.unwrap_or(dec!(0.005));
+
+        // Calculate margin required for new position
+        let margin_required = new_allocation_value / Decimal::from(leverage);
+
+        // Projected margin after entry
+        let projected_margin = total_margin - margin_required;
+
+        // Total position value after entry
+        let total_position_value = current_positions_value + new_allocation_value;
+
+        if projected_margin <= Decimal::ZERO {
+            return MarginHealth::Red;
+        }
+
+        // Maintenance margin for the total position
+        let maintenance_margin = total_position_value * maint_rate;
+
+        if maintenance_margin == Decimal::ZERO {
+            return MarginHealth::Green;
+        }
+
+        // Calculate projected margin ratio
+        let ratio = projected_margin / maintenance_margin;
+
+        // Convert ratio to health
+        if ratio >= dec!(5.0) {
+            MarginHealth::Green
+        } else if ratio >= dec!(3.0) {
+            MarginHealth::Yellow
+        } else if ratio >= dec!(2.0) {
+            MarginHealth::Orange
+        } else {
+            MarginHealth::Red
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +322,8 @@ mod tests {
             max_drawdown: dec!(0.05),
             min_margin_ratio: dec!(3.0),
             max_single_position: dec!(0.30),
+            min_holding_period_hours: 24,
+            min_yield_advantage: dec!(0.05),
             max_unprofitable_hours: 48,
             min_expected_yield: dec!(0.10),
             grace_period_hours: 8,
