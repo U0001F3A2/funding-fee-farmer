@@ -399,6 +399,14 @@ async fn main() -> Result<()> {
             };
 
             let mock_state = mock_client.get_state().await;
+
+            // Debug: log current positions for troubleshooting
+            debug!(
+                "📊 [DEBUG] current_positions ({} entries): {:?}",
+                current_positions.len(),
+                current_positions.keys().collect::<Vec<_>>()
+            );
+
             let allocations = allocator.calculate_allocation(
                 &qualified_pairs,
                 mock_state.balance,
@@ -446,6 +454,14 @@ async fn main() -> Result<()> {
                         // Calculate delta - only ADD to position, never reduce here
                         // (Reductions are handled by rebalancer)
                         let delta_qty = target_qty - current_position_qty.abs();
+
+                        // Debug: log what we're looking up
+                        debug!(
+                            "🔍 [LOOKUP] {} - current_positions has key: {}, value: {:?}",
+                            alloc.symbol,
+                            current_positions.contains_key(&alloc.symbol),
+                            current_positions.get(&alloc.symbol)
+                        );
 
                         // Skip if position already exists or delta is too small
                         if current_position_qty.abs() > Decimal::ZERO {
