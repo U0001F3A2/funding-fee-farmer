@@ -172,7 +172,7 @@ fn default_min_volume() -> Decimal {
 }
 
 fn default_min_funding_rate() -> Decimal {
-    Decimal::new(1, 3) // 0.001 (0.1%) - minimum to justify trading fees with 24h hold
+    Decimal::new(5, 4) // 0.0005 (0.05%) - optimal threshold based on 6-year backtest analysis
 }
 
 fn default_max_spread() -> Decimal {
@@ -257,11 +257,7 @@ impl Config {
 
         let config = config::Config::builder()
             .add_source(config::File::with_name("config").required(false))
-            .add_source(
-                config::Environment::default()
-                    .separator("__")
-                    .prefix("FFF"),
-            )
+            .add_source(config::Environment::default().separator("__").prefix("FFF"))
             .build()
             .context("Failed to build configuration")?;
 
@@ -279,8 +275,7 @@ impl Config {
         );
 
         anyhow::ensure!(
-            self.risk.max_drawdown > Decimal::ZERO
-                && self.risk.max_drawdown <= Decimal::ONE,
+            self.risk.max_drawdown > Decimal::ZERO && self.risk.max_drawdown <= Decimal::ONE,
             "max_drawdown must be between 0 and 1"
         );
 

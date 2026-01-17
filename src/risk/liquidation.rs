@@ -13,7 +13,10 @@ pub enum LiquidationAction {
     /// No action needed
     None,
     /// Reduce position by specified percentage
-    ReducePosition { symbol: String, reduction_pct: Decimal },
+    ReducePosition {
+        symbol: String,
+        reduction_pct: Decimal,
+    },
     /// Close position entirely
     ClosePosition { symbol: String },
     /// Add margin if possible
@@ -67,7 +70,8 @@ impl LiquidationGuard {
                 .unwrap_or(dec!(0.004));
 
             // Calculate position-specific margin
-            let position_margin = MarginMonitor::calculate_position_margin(pos, positions, total_margin);
+            let position_margin =
+                MarginMonitor::calculate_position_margin(pos, positions, total_margin);
 
             let ratio = self.margin_monitor.calculate_margin_ratio(
                 position_margin,
@@ -373,7 +377,10 @@ mod tests {
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            LiquidationAction::ReducePosition { symbol, reduction_pct } => {
+            LiquidationAction::ReducePosition {
+                symbol,
+                reduction_pct,
+            } => {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(*reduction_pct, dec!(0.25));
             }
@@ -396,7 +403,10 @@ mod tests {
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            LiquidationAction::ReducePosition { symbol, reduction_pct } => {
+            LiquidationAction::ReducePosition {
+                symbol,
+                reduction_pct,
+            } => {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(*reduction_pct, dec!(0.50));
             }
@@ -629,9 +639,15 @@ mod tests {
 
     #[test]
     fn test_liquidation_action_equality() {
-        let action1 = LiquidationAction::ClosePosition { symbol: "BTCUSDT".to_string() };
-        let action2 = LiquidationAction::ClosePosition { symbol: "BTCUSDT".to_string() };
-        let action3 = LiquidationAction::ClosePosition { symbol: "ETHUSDT".to_string() };
+        let action1 = LiquidationAction::ClosePosition {
+            symbol: "BTCUSDT".to_string(),
+        };
+        let action2 = LiquidationAction::ClosePosition {
+            symbol: "BTCUSDT".to_string(),
+        };
+        let action3 = LiquidationAction::ClosePosition {
+            symbol: "ETHUSDT".to_string(),
+        };
 
         assert_eq!(action1, action2);
         assert_ne!(action1, action3);

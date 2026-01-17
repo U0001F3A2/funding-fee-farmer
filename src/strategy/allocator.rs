@@ -81,10 +81,8 @@ impl CapitalAllocator {
         total_equity: Decimal,
         current_positions: &HashMap<String, Decimal>,
     ) -> Vec<PositionAllocation> {
-        let deployable_capital =
-            total_equity * self.capital_config.max_utilization;
-        let max_per_position =
-            total_equity * self.risk_config.max_single_position;
+        let deployable_capital = total_equity * self.capital_config.max_utilization;
+        let max_per_position = total_equity * self.risk_config.max_single_position;
         let leverage = Decimal::from(self.default_leverage);
 
         // === Margin Budget Tracking ===
@@ -94,7 +92,8 @@ impl CapitalAllocator {
 
         // Available margin = Total equity minus locked margin, respecting reserve buffer
         let reserve_amount = total_equity * self.capital_config.reserve_buffer;
-        let margin_budget = (total_equity - current_margin_locked - reserve_amount).max(Decimal::ZERO);
+        let margin_budget =
+            (total_equity - current_margin_locked - reserve_amount).max(Decimal::ZERO);
 
         // Track margin consumption as we allocate
         let mut margin_consumed = Decimal::ZERO;
@@ -397,16 +396,9 @@ mod tests {
             test_pair("ETHUSDT", dec!(0.0008), dec!(12)),
         ];
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &HashMap::new());
 
-        let total_allocated: Decimal = allocations
-            .iter()
-            .map(|a| a.target_size_usdt)
-            .sum();
+        let total_allocated: Decimal = allocations.iter().map(|a| a.target_size_usdt).sum();
 
         assert!(total_allocated <= dec!(85_000)); // 85% max utilization
     }
@@ -416,11 +408,7 @@ mod tests {
         let allocator = test_allocator();
         let pairs = vec![test_pair("BTCUSDT", dec!(0.01), dec!(100))];
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &HashMap::new());
 
         // Even with high score, should be capped at 30%
         assert!(allocations[0].target_size_usdt <= dec!(30_000));
@@ -431,11 +419,7 @@ mod tests {
         let allocator = test_allocator(); // default leverage = 5
         let pairs = vec![test_pair("BTCUSDT", dec!(0.001), dec!(10))];
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &HashMap::new());
 
         assert_eq!(allocations[0].leverage, 5);
     }
@@ -452,17 +436,14 @@ mod tests {
         let mut current = HashMap::new();
         current.insert("BTCUSDT".to_string(), dec!(25000)); // ~30% of deployable
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &current,
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &current);
 
         // BTC should be skipped since position is within 5% of target
         // Only ETH should be in allocations
         let btc_alloc = allocations.iter().find(|a| a.symbol == "BTCUSDT");
         assert!(
-            btc_alloc.is_none() || (btc_alloc.unwrap().target_size_usdt - dec!(25000)).abs() > dec!(1250)
+            btc_alloc.is_none()
+                || (btc_alloc.unwrap().target_size_usdt - dec!(25000)).abs() > dec!(1250)
         );
     }
 
@@ -494,11 +475,7 @@ mod tests {
             test_pair("SOLUSDT", dec!(0.0005), dec!(8)),  // Rank 3
         ];
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &HashMap::new());
 
         assert_eq!(allocations.len(), 3);
         assert_eq!(allocations[0].priority, 1);
@@ -583,11 +560,7 @@ mod tests {
 
         // margin=10000, leverage=5, ratio_target=3
         // Position = (10000 × 5) / 3 = 16666.67
-        let max_pos = allocator.max_safe_position(
-            dec!(10000),
-            5,
-            dec!(3),
-        );
+        let max_pos = allocator.max_safe_position(dec!(10000), 5, dec!(3));
 
         // Should be approximately 16666.67
         assert!(max_pos > dec!(16000));
@@ -628,11 +601,7 @@ mod tests {
         let allocator = test_allocator();
         let pairs = vec![test_pair("BTCUSDT", dec!(0.001), dec!(15))];
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &HashMap::new());
 
         assert_eq!(allocations.len(), 1);
         let alloc = &allocations[0];
@@ -650,11 +619,7 @@ mod tests {
     fn test_empty_pairs_empty_allocation() {
         let allocator = test_allocator();
 
-        let allocations = allocator.calculate_allocation(
-            &[],
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let allocations = allocator.calculate_allocation(&[], dec!(100_000), &HashMap::new());
 
         assert!(allocations.is_empty());
     }
@@ -665,22 +630,14 @@ mod tests {
         let pairs = vec![test_pair("BTCUSDT", dec!(0.001), dec!(15))];
 
         // Calculate what target would be without existing position
-        let fresh_alloc = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &HashMap::new(),
-        );
+        let fresh_alloc = allocator.calculate_allocation(&pairs, dec!(100_000), &HashMap::new());
         let target = fresh_alloc[0].target_size_usdt;
 
         // Now set existing position within 5% of target
         let mut current = HashMap::new();
         current.insert("BTCUSDT".to_string(), target * dec!(0.98)); // 2% off
 
-        let allocations = allocator.calculate_allocation(
-            &pairs,
-            dec!(100_000),
-            &current,
-        );
+        let allocations = allocator.calculate_allocation(&pairs, dec!(100_000), &current);
 
         // Should skip since within 5% tolerance
         assert!(allocations.is_empty());

@@ -264,10 +264,13 @@ impl MockBinanceClient {
         let fee = notional * self.fee_rate;
 
         // Update position
-        let position = state.positions.entry(order.symbol.clone()).or_insert_with(|| MockPosition {
-            symbol: order.symbol.clone(),
-            ..Default::default()
-        });
+        let position = state
+            .positions
+            .entry(order.symbol.clone())
+            .or_insert_with(|| MockPosition {
+                symbol: order.symbol.clone(),
+                ..Default::default()
+            });
 
         match order.side {
             OrderSide::Buy => {
@@ -324,10 +327,13 @@ impl MockBinanceClient {
 
         // Update position
         let borrowed_amount = {
-            let position = state.positions.entry(order.symbol.clone()).or_insert_with(|| MockPosition {
-                symbol: order.symbol.clone(),
-                ..Default::default()
-            });
+            let position = state
+                .positions
+                .entry(order.symbol.clone())
+                .or_insert_with(|| MockPosition {
+                    symbol: order.symbol.clone(),
+                    ..Default::default()
+                });
 
             match order.side {
                 OrderSide::Buy => {
@@ -430,14 +436,16 @@ impl MockBinanceClient {
         for (symbol, position) in &state.positions {
             if let Some(&current_price) = prices.get(symbol) {
                 // Futures PnL
-                let futures_pnl = position.futures_qty * (current_price - position.futures_entry_price);
+                let futures_pnl =
+                    position.futures_qty * (current_price - position.futures_entry_price);
                 // Spot PnL
                 let spot_pnl = position.spot_qty * (current_price - position.spot_entry_price);
                 unrealized_pnl += futures_pnl + spot_pnl;
             }
         }
 
-        let realized_pnl = state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
+        let realized_pnl =
+            state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
 
         (realized_pnl, unrealized_pnl)
     }
@@ -706,7 +714,9 @@ mod tests {
         let mut rates = HashMap::new();
         prices.insert("BTCUSDT".to_string(), dec!(50000));
         rates.insert("BTCUSDT".to_string(), dec!(0.001)); // 0.1% positive rate
-        client.update_market_data(rates.clone(), prices.clone()).await;
+        client
+            .update_market_data(rates.clone(), prices.clone())
+            .await;
 
         // Open short futures position (qty = -1.0)
         open_short_futures_position(&client, "BTCUSDT", dec!(1.0)).await;
@@ -1097,9 +1107,8 @@ mod tests {
         let state = client.get_state().await;
 
         // Realized PnL = funding - fees - interest
-        let expected = state.total_funding_received
-            - state.total_trading_fees
-            - state.total_borrow_interest;
+        let expected =
+            state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
         assert_eq!(realized_pnl, expected);
     }
 

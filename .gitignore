@@ -42,3 +42,4 @@ data/
 
 # EC2 host (local reference)
 .ec2_host
+venv/

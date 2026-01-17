@@ -634,9 +634,18 @@ mod tests {
         precisions.insert("SOLUSDT".to_string(), 2);
         executor.set_precisions(precisions);
 
-        assert_eq!(executor.round_quantity(dec!(0.123456), "BTCUSDT"), dec!(0.12346));
-        assert_eq!(executor.round_quantity(dec!(0.123456), "ETHUSDT"), dec!(0.1235));
-        assert_eq!(executor.round_quantity(dec!(0.123456), "SOLUSDT"), dec!(0.12));
+        assert_eq!(
+            executor.round_quantity(dec!(0.123456), "BTCUSDT"),
+            dec!(0.12346)
+        );
+        assert_eq!(
+            executor.round_quantity(dec!(0.123456), "ETHUSDT"),
+            dec!(0.1235)
+        );
+        assert_eq!(
+            executor.round_quantity(dec!(0.123456), "SOLUSDT"),
+            dec!(0.12)
+        );
     }
 
     // =========================================================================

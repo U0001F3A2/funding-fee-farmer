@@ -93,10 +93,7 @@ impl MarginMonitor {
             MarginType::Isolated => position.isolated_margin,
             MarginType::Cross => {
                 // Calculate total notional across all positions
-                let total_notional: Decimal = all_positions
-                    .iter()
-                    .map(|p| p.notional.abs())
-                    .sum();
+                let total_notional: Decimal = all_positions.iter().map(|p| p.notional.abs()).sum();
 
                 if total_notional == Decimal::ZERO {
                     return Decimal::ZERO;
@@ -186,11 +183,8 @@ impl MarginMonitor {
             // Calculate position-specific margin
             let position_margin = Self::calculate_position_margin(pos, positions, total_margin);
 
-            let ratio = self.calculate_margin_ratio(
-                position_margin,
-                maint_rate,
-                pos.notional.abs(),
-            );
+            let ratio =
+                self.calculate_margin_ratio(position_margin, maint_rate, pos.notional.abs());
 
             let health = self.get_health(ratio);
 
@@ -236,11 +230,8 @@ impl MarginMonitor {
         target_health: MarginHealth,
     ) -> Decimal {
         let target_ratio = target_health.threshold();
-        let current_ratio = self.calculate_margin_ratio(
-            position_margin,
-            maintenance_margin_rate,
-            position_value,
-        );
+        let current_ratio =
+            self.calculate_margin_ratio(position_margin, maintenance_margin_rate, position_value);
 
         if current_ratio >= target_ratio {
             return Decimal::ZERO;
@@ -341,9 +332,9 @@ mod tests {
 
         // $10,000 position margin, 0.4% maint rate, $50,000 position
         let ratio = monitor.calculate_margin_ratio(
-            dec!(10000),     // position_margin
-            dec!(0.004),     // maintenance_margin_rate
-            dec!(50000),     // position_value
+            dec!(10000), // position_margin
+            dec!(0.004), // maintenance_margin_rate
+            dec!(50000), // position_value
         );
 
         // Maintenance margin = 50000 * 0.004 = 200
@@ -367,7 +358,7 @@ mod tests {
             liquidation_price: dec!(45000),
             leverage: 5,
             position_side: PositionSide::Both,
-            notional: dec!(50000),  // $50k notional
+            notional: dec!(50000), // $50k notional
             isolated_margin: Decimal::ZERO,
             margin_type: MarginType::Cross,
         };
@@ -381,7 +372,7 @@ mod tests {
             liquidation_price: dec!(2700),
             leverage: 5,
             position_side: PositionSide::Both,
-            notional: dec!(30000),  // $30k notional
+            notional: dec!(30000), // $30k notional
             isolated_margin: Decimal::ZERO,
             margin_type: MarginType::Cross,
         };
@@ -393,8 +384,10 @@ mod tests {
         // BTC gets: (50k / 80k) * 10k = $6,250 margin
         // ETH gets: (30k / 80k) * 10k = $3,750 margin
 
-        let btc_margin = MarginMonitor::calculate_position_margin(&pos1, &all_positions, total_margin);
-        let eth_margin = MarginMonitor::calculate_position_margin(&pos2, &all_positions, total_margin);
+        let btc_margin =
+            MarginMonitor::calculate_position_margin(&pos1, &all_positions, total_margin);
+        let eth_margin =
+            MarginMonitor::calculate_position_margin(&pos2, &all_positions, total_margin);
 
         assert_eq!(btc_margin, dec!(6250));
         assert_eq!(eth_margin, dec!(3750));
@@ -425,14 +418,15 @@ mod tests {
             leverage: 5,
             position_side: PositionSide::Both,
             notional: dec!(50000),
-            isolated_margin: dec!(12000),  // Dedicated $12k margin
+            isolated_margin: dec!(12000), // Dedicated $12k margin
             margin_type: MarginType::Isolated,
         };
 
         let all_positions = vec![isolated_pos.clone()];
-        let total_margin = dec!(100000);  // Total margin doesn't matter for isolated
+        let total_margin = dec!(100000); // Total margin doesn't matter for isolated
 
-        let margin = MarginMonitor::calculate_position_margin(&isolated_pos, &all_positions, total_margin);
+        let margin =
+            MarginMonitor::calculate_position_margin(&isolated_pos, &all_positions, total_margin);
 
         // Should use isolated_margin, not share total_margin
         assert_eq!(margin, dec!(12000));
@@ -501,11 +495,7 @@ mod tests {
         let monitor = test_monitor();
 
         // Zero position value should return MAX (no risk)
-        let ratio = monitor.calculate_margin_ratio(
-            dec!(10000),
-            dec!(0.004),
-            Decimal::ZERO,
-        );
+        let ratio = monitor.calculate_margin_ratio(dec!(10000), dec!(0.004), Decimal::ZERO);
 
         assert_eq!(ratio, Decimal::MAX);
     }
@@ -516,11 +506,7 @@ mod tests {
 
         // Zero maintenance rate means zero maintenance margin
         // This should return MAX to avoid division by zero
-        let ratio = monitor.calculate_margin_ratio(
-            dec!(10000),
-            Decimal::ZERO,
-            dec!(50000),
-        );
+        let ratio = monitor.calculate_margin_ratio(dec!(10000), Decimal::ZERO, dec!(50000));
 
         assert_eq!(ratio, Decimal::MAX);
     }
@@ -531,9 +517,9 @@ mod tests {
 
         // Small margin relative to position = low ratio
         let ratio = monitor.calculate_margin_ratio(
-            dec!(100),       // Only $100 margin
-            dec!(0.004),     // 0.4% maintenance
-            dec!(50000),     // $50k position
+            dec!(100),   // Only $100 margin
+            dec!(0.004), // 0.4% maintenance
+            dec!(50000), // $50k position
         );
 
         // Maintenance margin = 50000 * 0.004 = 200
@@ -548,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_build_maintenance_rate_map_basic() {
-        use crate::exchange::{NotionalBracket, LeverageBracket, MarginType, PositionSide};
+        use crate::exchange::{LeverageBracket, MarginType, NotionalBracket, PositionSide};
 
         let brackets = vec![LeverageBracket {
             symbol: "BTCUSDT".to_string(),
@@ -593,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_build_maintenance_rate_map_higher_bracket() {
-        use crate::exchange::{NotionalBracket, LeverageBracket, MarginType, PositionSide};
+        use crate::exchange::{LeverageBracket, MarginType, NotionalBracket, PositionSide};
 
         let brackets = vec![LeverageBracket {
             symbol: "BTCUSDT".to_string(),
@@ -639,7 +625,7 @@ mod tests {
 
     #[test]
     fn test_build_maintenance_rate_map_no_position() {
-        use crate::exchange::{NotionalBracket, LeverageBracket};
+        use crate::exchange::{LeverageBracket, NotionalBracket};
 
         let brackets = vec![LeverageBracket {
             symbol: "BTCUSDT".to_string(),
@@ -688,16 +674,16 @@ mod tests {
         let mut maintenance_rates = HashMap::new();
         maintenance_rates.insert("BTCUSDT".to_string(), dec!(0.004));
 
-        let (health, position_health) = monitor.check_positions(
-            &positions,
-            dec!(10000),
-            &maintenance_rates,
-        );
+        let (health, position_health) =
+            monitor.check_positions(&positions, dec!(10000), &maintenance_rates);
 
         // Ratio = 5000 / (5000 * 0.004) = 5000 / 20 = 250 -> Green
         assert_eq!(health, MarginHealth::Green);
         assert_eq!(position_health.len(), 1);
-        assert_eq!(position_health[0], ("BTCUSDT".to_string(), MarginHealth::Green));
+        assert_eq!(
+            position_health[0],
+            ("BTCUSDT".to_string(), MarginHealth::Green)
+        );
     }
 
     #[test]
@@ -739,11 +725,8 @@ mod tests {
         maintenance_rates.insert("BTCUSDT".to_string(), dec!(0.004));
         maintenance_rates.insert("ETHUSDT".to_string(), dec!(0.004));
 
-        let (health, position_health) = monitor.check_positions(
-            &positions,
-            dec!(50000),
-            &maintenance_rates,
-        );
+        let (health, position_health) =
+            monitor.check_positions(&positions, dec!(50000), &maintenance_rates);
 
         // BTC: 1000 / (50000 * 0.004) = 1000 / 200 = 5 -> Green
         // ETH: 30000 / (30000 * 0.004) = 30000 / 120 = 250 -> Green
@@ -781,11 +764,8 @@ mod tests {
         let mut maintenance_rates = HashMap::new();
         maintenance_rates.insert("BTCUSDT".to_string(), dec!(0.004));
 
-        let (health, position_health) = monitor.check_positions(
-            &positions,
-            dec!(10000),
-            &maintenance_rates,
-        );
+        let (health, position_health) =
+            monitor.check_positions(&positions, dec!(10000), &maintenance_rates);
 
         // Maint margin = 50000 * 0.004 = 200
         // Ratio = 100 / 200 = 0.5 -> Red (< 2.0)
@@ -815,11 +795,8 @@ mod tests {
 
         let maintenance_rates = HashMap::new();
 
-        let (health, position_health) = monitor.check_positions(
-            &positions,
-            dec!(10000),
-            &maintenance_rates,
-        );
+        let (health, position_health) =
+            monitor.check_positions(&positions, dec!(10000), &maintenance_rates);
 
         // Zero position should be skipped
         assert_eq!(health, MarginHealth::Green);
@@ -849,11 +826,7 @@ mod tests {
         // Empty maintenance rates - should use fallback 0.4%
         let maintenance_rates = HashMap::new();
 
-        let (health, _) = monitor.check_positions(
-            &positions,
-            dec!(1000),
-            &maintenance_rates,
-        );
+        let (health, _) = monitor.check_positions(&positions, dec!(1000), &maintenance_rates);
 
         // Uses fallback rate 0.004
         // Maint margin = 100 * 0.004 = 0.4
@@ -871,9 +844,9 @@ mod tests {
 
         // Already at Green health - no reduction needed
         let reduction = monitor.calculate_reduction_needed(
-            dec!(10000),    // position_margin
-            dec!(0.004),    // maintenance_margin_rate
-            dec!(50000),    // position_value
+            dec!(10000), // position_margin
+            dec!(0.004), // maintenance_margin_rate
+            dec!(50000), // position_value
             MarginHealth::Green,
         );
 
@@ -888,9 +861,9 @@ mod tests {
 
         // Unhealthy position needing reduction
         let reduction = monitor.calculate_reduction_needed(
-            dec!(300),      // position_margin
-            dec!(0.004),    // maintenance_margin_rate
-            dec!(50000),    // position_value
+            dec!(300),            // position_margin
+            dec!(0.004),          // maintenance_margin_rate
+            dec!(50000),          // position_value
             MarginHealth::Yellow, // Target Yellow (ratio >= 3.0)
         );
 
@@ -906,9 +879,9 @@ mod tests {
         let monitor = test_monitor();
 
         let reduction = monitor.calculate_reduction_needed(
-            dec!(100),      // position_margin
-            dec!(0.004),    // maintenance_margin_rate
-            dec!(10000),    // position_value
+            dec!(100),           // position_margin
+            dec!(0.004),         // maintenance_margin_rate
+            dec!(10000),         // position_value
             MarginHealth::Green, // Target Green (ratio >= 5.0)
         );
 
@@ -925,9 +898,9 @@ mod tests {
 
         // Position exactly at Yellow boundary
         let reduction = monitor.calculate_reduction_needed(
-            dec!(600),      // position_margin
-            dec!(0.004),    // maintenance_margin_rate
-            dec!(50000),    // position_value
+            dec!(600),   // position_margin
+            dec!(0.004), // maintenance_margin_rate
+            dec!(50000), // position_value
             MarginHealth::Yellow,
         );
 
@@ -961,7 +934,8 @@ mod tests {
         let all_positions = vec![position.clone()];
         let total_margin = dec!(10000);
 
-        let margin = MarginMonitor::calculate_position_margin(&position, &all_positions, total_margin);
+        let margin =
+            MarginMonitor::calculate_position_margin(&position, &all_positions, total_margin);
 
         // Single position gets all margin
         assert_eq!(margin, dec!(10000));
@@ -1002,8 +976,10 @@ mod tests {
         let all_positions = vec![pos1.clone(), pos2.clone()];
         let total_margin = dec!(10000);
 
-        let btc_margin = MarginMonitor::calculate_position_margin(&pos1, &all_positions, total_margin);
-        let eth_margin = MarginMonitor::calculate_position_margin(&pos2, &all_positions, total_margin);
+        let btc_margin =
+            MarginMonitor::calculate_position_margin(&pos1, &all_positions, total_margin);
+        let eth_margin =
+            MarginMonitor::calculate_position_margin(&pos2, &all_positions, total_margin);
 
         // Total notional = 60k + 40k = 100k
         // BTC gets: (60k / 100k) * 10k = 6k
@@ -1033,7 +1009,8 @@ mod tests {
         let all_positions = vec![position.clone()];
         let total_margin = dec!(10000);
 
-        let margin = MarginMonitor::calculate_position_margin(&position, &all_positions, total_margin);
+        let margin =
+            MarginMonitor::calculate_position_margin(&position, &all_positions, total_margin);
 
         // Zero notional = zero margin allocation
         assert_eq!(margin, Decimal::ZERO);

@@ -8,26 +8,26 @@
 //! - Funding payment verification
 //! - Malfunction detection
 
+mod funding_verifier;
 mod liquidation;
+mod malfunction;
 mod margin;
 mod mdd;
-mod position_tracker;
-mod funding_verifier;
-mod malfunction;
 mod orchestrator;
+mod position_tracker;
 
-pub use liquidation::{LiquidationGuard, LiquidationAction};
-pub use margin::{MarginMonitor, MarginHealth};
-pub use mdd::{DrawdownTracker, DrawdownStats};
-pub use position_tracker::{
-    PositionTracker, TrackedPosition, PositionEntry, PositionAction, PositionLossConfig,
-};
 pub use funding_verifier::{
-    FundingVerifier, FundingRecord, FundingVerificationResult, FundingStats,
+    FundingRecord, FundingStats, FundingVerificationResult, FundingVerifier,
 };
+pub use liquidation::{LiquidationAction, LiquidationGuard};
 pub use malfunction::{
-    MalfunctionDetector, MalfunctionAlert, MalfunctionType, MalfunctionConfig, AlertSeverity,
+    AlertSeverity, MalfunctionAlert, MalfunctionConfig, MalfunctionDetector, MalfunctionType,
 };
+pub use margin::{MarginHealth, MarginMonitor};
+pub use mdd::{DrawdownStats, DrawdownTracker};
 pub use orchestrator::{
-    RiskOrchestrator, RiskOrchestratorConfig, RiskCheckResult, RiskAlert, RiskAlertType,
+    RiskAlert, RiskAlertType, RiskCheckResult, RiskOrchestrator, RiskOrchestratorConfig,
+};
+pub use position_tracker::{
+    PositionAction, PositionEntry, PositionLossConfig, PositionTracker, TrackedPosition,
 };

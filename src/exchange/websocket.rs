@@ -144,17 +144,11 @@ impl BinanceWebSocket {
     }
 
     /// Subscribe to mark price stream for all symbols.
-    pub async fn subscribe_mark_price_all(
-        &self,
-        tx: mpsc::Sender<WsEvent>,
-    ) -> Result<()> {
+    pub async fn subscribe_mark_price_all(&self, tx: mpsc::Sender<WsEvent>) -> Result<()> {
         let url = format!("{}/ws/!markPrice@arr@1s", self.base_url);
         self.connect_and_handle(url, tx, |msg| {
             if let Ok(updates) = serde_json::from_str::<Vec<MarkPriceUpdate>>(&msg) {
-                updates
-                    .into_iter()
-                    .map(WsEvent::MarkPrice)
-                    .collect()
+                updates.into_iter().map(WsEvent::MarkPrice).collect()
             } else {
                 vec![]
             }

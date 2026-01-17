@@ -117,12 +117,8 @@ impl FundingVerifier {
         };
 
         // Determine if this is an anomaly
-        let (is_anomaly, anomaly_reason) = self.check_anomaly(
-            symbol,
-            expected_amount,
-            actual_received,
-            deviation_pct,
-        );
+        let (is_anomaly, anomaly_reason) =
+            self.check_anomaly(symbol, expected_amount, actual_received, deviation_pct);
 
         // Record the funding
         let record = FundingRecord {
@@ -215,10 +211,7 @@ impl FundingVerifier {
 
         // Case 4: Received unexpected large amount
         if expected.abs() < dec!(0.001) && actual.abs() > dec!(1) {
-            return (
-                true,
-                Some(format!("Unexpected funding of ${:.4}", actual)),
-            );
+            return (true, Some(format!("Unexpected funding of ${:.4}", actual)));
         }
 
         (false, None)
@@ -233,10 +226,13 @@ impl FundingVerifier {
         deviation: Decimal,
         is_anomaly: bool,
     ) {
-        let stats = self.stats.entry(symbol.to_string()).or_insert(FundingStats {
-            symbol: symbol.to_string(),
-            ..Default::default()
-        });
+        let stats = self
+            .stats
+            .entry(symbol.to_string())
+            .or_insert(FundingStats {
+                symbol: symbol.to_string(),
+                ..Default::default()
+            });
 
         stats.total_received += actual;
         stats.total_expected += expected;

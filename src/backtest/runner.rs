@@ -213,7 +213,10 @@ impl SweepResults {
 
         if let Some((config, result)) = self.best_sharpe() {
             s.push_str("BEST BY SHARPE RATIO:\n");
-            s.push_str(&format!("  Config: {}\n", ParameterSpace::describe_config(config)));
+            s.push_str(&format!(
+                "  Config: {}\n",
+                ParameterSpace::describe_config(config)
+            ));
             s.push_str(&format!(
                 "  Sharpe: {:.3} | Return: {:.2}% | MaxDD: {:.2}%\n\n",
                 result.metrics.sharpe_ratio,
@@ -224,7 +227,10 @@ impl SweepResults {
 
         if let Some((config, result)) = self.best_return() {
             s.push_str("BEST BY RETURN:\n");
-            s.push_str(&format!("  Config: {}\n", ParameterSpace::describe_config(config)));
+            s.push_str(&format!(
+                "  Config: {}\n",
+                ParameterSpace::describe_config(config)
+            ));
             s.push_str(&format!(
                 "  Return: {:.2}% | Sharpe: {:.3} | MaxDD: {:.2}%\n\n",
                 result.metrics.total_return_pct,
@@ -235,7 +241,10 @@ impl SweepResults {
 
         if let Some((config, result)) = self.best_calmar() {
             s.push_str("BEST BY CALMAR RATIO:\n");
-            s.push_str(&format!("  Config: {}\n", ParameterSpace::describe_config(config)));
+            s.push_str(&format!(
+                "  Config: {}\n",
+                ParameterSpace::describe_config(config)
+            ));
             s.push_str(&format!(
                 "  Calmar: {:.3} | Return: {:.2}% | MaxDD: {:.2}%\n",
                 result.metrics.calmar_ratio,

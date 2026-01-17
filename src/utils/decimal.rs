@@ -53,11 +53,10 @@ pub fn safe_div(numerator: Decimal, denominator: Decimal) -> Decimal {
 
 /// Calculate weighted average.
 pub fn weighted_average(values: &[(Decimal, Decimal)]) -> Decimal {
-    let (sum, weight_sum) = values
-        .iter()
-        .fold((Decimal::ZERO, Decimal::ZERO), |(sum, weight_sum), (val, weight)| {
-            (sum + val * weight, weight_sum + weight)
-        });
+    let (sum, weight_sum) = values.iter().fold(
+        (Decimal::ZERO, Decimal::ZERO),
+        |(sum, weight_sum), (val, weight)| (sum + val * weight, weight_sum + weight),
+    );
 
     safe_div(sum, weight_sum)
 }

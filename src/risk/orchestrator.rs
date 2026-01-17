@@ -19,12 +19,10 @@ use tracing::{debug, error, info, warn};
 use crate::exchange::Position;
 
 use super::{
-    DrawdownTracker,
-    MarginHealth, MarginMonitor,
-    LiquidationGuard, LiquidationAction,
-    PositionTracker, PositionLossConfig, PositionEntry, PositionAction, TrackedPosition,
-    FundingVerifier, FundingVerificationResult,
-    MalfunctionDetector, MalfunctionConfig, MalfunctionAlert, AlertSeverity,
+    AlertSeverity, DrawdownTracker, FundingVerificationResult, FundingVerifier, LiquidationAction,
+    LiquidationGuard, MalfunctionAlert, MalfunctionConfig, MalfunctionDetector, MarginHealth,
+    MarginMonitor, PositionAction, PositionEntry, PositionLossConfig, PositionTracker,
+    TrackedPosition,
 };
 
 /// Unified risk configuration.
@@ -86,9 +84,7 @@ pub enum RiskAlertType {
         action: String,
     },
     /// Liquidation risk detected
-    LiquidationRisk {
-        action: LiquidationAction,
-    },
+    LiquidationRisk { action: LiquidationAction },
     /// Position is unprofitable
     PositionLoss {
         symbol: String,
@@ -96,24 +92,13 @@ pub enum RiskAlertType {
         hours: u32,
     },
     /// Funding payment anomaly
-    FundingAnomaly {
-        symbol: String,
-        deviation: Decimal,
-    },
+    FundingAnomaly { symbol: String, deviation: Decimal },
     /// System malfunction
-    Malfunction {
-        malfunction_type: String,
-    },
+    Malfunction { malfunction_type: String },
     /// Drawdown exceeded
-    DrawdownExceeded {
-        current: Decimal,
-        limit: Decimal,
-    },
+    DrawdownExceeded { current: Decimal, limit: Decimal },
     /// Delta drift detected
-    DeltaDrift {
-        symbol: String,
-        drift_pct: Decimal,
-    },
+    DeltaDrift { symbol: String, drift_pct: Decimal },
 }
 
 /// A unified risk alert.
@@ -308,7 +293,8 @@ impl RiskOrchestrator {
 
         // 2. Check margin health
         let (worst_health, _position_health) =
-            self.margin_monitor.check_positions(positions, total_margin, maintenance_rates);
+            self.margin_monitor
+                .check_positions(positions, total_margin, maintenance_rates);
         result.margin_health = worst_health;
 
         match worst_health {
@@ -355,7 +341,9 @@ impl RiskOrchestrator {
         }
 
         // 3. Check liquidation risk
-        let liquidation_actions = self.liquidation_guard.evaluate(positions, total_margin, maintenance_rates);
+        let liquidation_actions =
+            self.liquidation_guard
+                .evaluate(positions, total_margin, maintenance_rates);
         for action in liquidation_actions {
             let (symbol, severity, message) = match &action {
                 LiquidationAction::ClosePosition { symbol } => (
@@ -363,10 +351,17 @@ impl RiskOrchestrator {
                     AlertSeverity::Critical,
                     format!("Position {} requires immediate closure", symbol),
                 ),
-                LiquidationAction::ReducePosition { symbol, reduction_pct } => (
+                LiquidationAction::ReducePosition {
+                    symbol,
+                    reduction_pct,
+                } => (
                     symbol.clone(),
                     AlertSeverity::Error,
-                    format!("Position {} needs {:.0}% reduction", symbol, reduction_pct * dec!(100)),
+                    format!(
+                        "Position {} needs {:.0}% reduction",
+                        symbol,
+                        reduction_pct * dec!(100)
+                    ),
                 ),
                 LiquidationAction::AddMargin { symbol, amount } => (
                     symbol.clone(),
@@ -376,17 +371,15 @@ impl RiskOrchestrator {
                 LiquidationAction::None => continue,
             };
 
-            result.alerts.push(
-                RiskAlert::new(
-                    RiskAlertType::LiquidationRisk {
-                        action: action.clone(),
-                    },
-                    severity,
-                    Some(symbol.clone()),
-                    message,
-                    format!("{:?}", action),
-                ),
-            );
+            result.alerts.push(RiskAlert::new(
+                RiskAlertType::LiquidationRisk {
+                    action: action.clone(),
+                },
+                severity,
+                Some(symbol.clone()),
+                message,
+                format!("{:?}", action),
+            ));
 
             // Add to positions to close if critical
             if matches!(action, LiquidationAction::ClosePosition { .. }) {
@@ -395,7 +388,13 @@ impl RiskOrchestrator {
         }
 
         // 4. Check position health
-        for symbol in self.position_tracker.all_positions().keys().cloned().collect::<Vec<_>>() {
+        for symbol in self
+            .position_tracker
+            .all_positions()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             match self.position_tracker.evaluate_position(&symbol) {
                 PositionAction::ForceExit { reason } => {
                     result.positions_to_close.push(symbol.clone());
@@ -411,7 +410,10 @@ impl RiskOrchestrator {
                         format!("Close position {}", symbol),
                     ));
                 }
-                PositionAction::ConsiderExit { reason, hours_unprofitable } => {
+                PositionAction::ConsiderExit {
+                    reason,
+                    hours_unprofitable,
+                } => {
                     result.alerts.push(RiskAlert::new(
                         RiskAlertType::PositionLoss {
                             symbol: symbol.clone(),
@@ -444,15 +446,17 @@ impl RiskOrchestrator {
 
         // Circuit breaker: track consecutive cycles with ERROR/CRITICAL alerts
         let has_critical_alerts = result.alerts.iter().any(|alert| {
-            matches!(alert.severity, AlertSeverity::Error | AlertSeverity::Critical)
+            matches!(
+                alert.severity,
+                AlertSeverity::Error | AlertSeverity::Critical
+            )
         });
 
         if has_critical_alerts {
             self.consecutive_risk_cycles += 1;
             debug!(
                 "Risk cycle with critical alerts (consecutive: {}/{})",
-                self.consecutive_risk_cycles,
-                self.config.max_consecutive_risk_cycles
+                self.consecutive_risk_cycles, self.config.max_consecutive_risk_cycles
             );
 
             if self.consecutive_risk_cycles >= self.config.max_consecutive_risk_cycles {
@@ -518,8 +522,13 @@ impl RiskOrchestrator {
     }
 
     /// Check delta drift.
-    pub fn check_delta_drift(&mut self, symbol: &str, drift_pct: Decimal) -> Option<MalfunctionAlert> {
-        self.malfunction_detector.check_delta_drift(symbol, drift_pct)
+    pub fn check_delta_drift(
+        &mut self,
+        symbol: &str,
+        drift_pct: Decimal,
+    ) -> Option<MalfunctionAlert> {
+        self.malfunction_detector
+            .check_delta_drift(symbol, drift_pct)
     }
 
     /// Open a tracked position (entry contains symbol).
@@ -527,21 +536,28 @@ impl RiskOrchestrator {
         let symbol = entry.symbol.clone();
         let expected_rate = entry.expected_funding_rate;
         self.position_tracker.open_position(&symbol, entry);
-        self.funding_verifier.set_expected_rate(&symbol, expected_rate);
+        self.funding_verifier
+            .set_expected_rate(&symbol, expected_rate);
     }
 
     /// Record funding payment for a symbol.
     pub fn record_funding(&mut self, symbol: &str, amount: Decimal) {
         if let Some(pos) = self.position_tracker.get_position(symbol) {
             let expected = pos.expected_funding_rate * pos.position_value;
-            self.position_tracker.record_funding(symbol, amount, expected);
+            self.position_tracker
+                .record_funding(symbol, amount, expected);
         }
     }
 
     /// Verify funding payment against expected.
-    pub fn verify_funding(&mut self, symbol: &str, actual_funding: Decimal) -> FundingVerificationResult {
+    pub fn verify_funding(
+        &mut self,
+        symbol: &str,
+        actual_funding: Decimal,
+    ) -> FundingVerificationResult {
         if let Some(pos) = self.position_tracker.get_position(symbol) {
-            self.funding_verifier.verify_funding(symbol, pos.position_value, actual_funding)
+            self.funding_verifier
+                .verify_funding(symbol, pos.position_value, actual_funding)
         } else {
             FundingVerificationResult {
                 symbol: symbol.to_string(),
@@ -693,16 +709,31 @@ mod tests {
         let maintenance_rates = std::collections::HashMap::new();
 
         // First cycle with ERROR alert - should not halt
-        let result1 = orchestrator.check_all(&[position.clone()], equity, margin_balance, &maintenance_rates);
+        let result1 = orchestrator.check_all(
+            &[position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
         assert!(!result1.should_halt);
         assert!(!result1.alerts.is_empty());
 
         // Second cycle with ERROR alert - should not halt
-        let result2 = orchestrator.check_all(&[position.clone()], equity, margin_balance, &maintenance_rates);
+        let result2 = orchestrator.check_all(
+            &[position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
         assert!(!result2.should_halt);
 
         // Third cycle with ERROR alert - SHOULD HALT (circuit breaker triggered)
-        let result3 = orchestrator.check_all(&[position.clone()], equity, margin_balance, &maintenance_rates);
+        let result3 = orchestrator.check_all(
+            &[position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
         assert!(result3.should_halt);
 
         // Verify circuit breaker alert was added
@@ -742,16 +773,37 @@ mod tests {
         let maintenance_rates = std::collections::HashMap::new();
 
         // Two cycles with ERROR alerts
-        orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
-        orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
+        orchestrator.check_all(
+            &[error_position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
+        orchestrator.check_all(
+            &[error_position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
 
         // One cycle with no positions (no critical alerts) - should reset counter
-        let result_clean = orchestrator.check_all(&[], dec!(10000), dec!(10000), &maintenance_rates);
+        let result_clean =
+            orchestrator.check_all(&[], dec!(10000), dec!(10000), &maintenance_rates);
         assert!(!result_clean.should_halt);
 
         // Now even after 2 more cycles with alerts, should not halt (counter was reset)
-        orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
-        let result = orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
+        orchestrator.check_all(
+            &[error_position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
+        let result = orchestrator.check_all(
+            &[error_position.clone()],
+            equity,
+            margin_balance,
+            &maintenance_rates,
+        );
         assert!(!result.should_halt);
     }
 
@@ -823,7 +875,9 @@ mod tests {
     fn test_risk_alert_with_symbol() {
         let alert = RiskAlert::new(
             RiskAlertType::LiquidationRisk {
-                action: LiquidationAction::ClosePosition { symbol: "BTCUSDT".to_string() },
+                action: LiquidationAction::ClosePosition {
+                    symbol: "BTCUSDT".to_string(),
+                },
             },
             AlertSeverity::Critical,
             Some("BTCUSDT".to_string()),
@@ -899,7 +953,11 @@ mod tests {
         };
 
         match alert {
-            RiskAlertType::PositionLoss { symbol, reason, hours } => {
+            RiskAlertType::PositionLoss {
+                symbol,
+                reason,
+                hours,
+            } => {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(hours, 48);
                 assert!(reason.contains("48h"));
@@ -963,9 +1021,10 @@ mod tests {
         assert!(result.should_halt);
         assert!(result.drawdown_pct >= dec!(0.05));
 
-        let has_drawdown_alert = result.alerts.iter().any(|a| {
-            matches!(&a.alert_type, RiskAlertType::DrawdownExceeded { .. })
-        });
+        let has_drawdown_alert = result
+            .alerts
+            .iter()
+            .any(|a| matches!(&a.alert_type, RiskAlertType::DrawdownExceeded { .. }));
         assert!(has_drawdown_alert);
     }
 
@@ -978,12 +1037,7 @@ mod tests {
         let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
 
         // Only 3% drawdown - safe
-        let result = orchestrator.check_all(
-            &[],
-            dec!(9700),
-            dec!(10000),
-            &HashMap::new(),
-        );
+        let result = orchestrator.check_all(&[], dec!(9700), dec!(10000), &HashMap::new());
 
         assert!(!result.should_halt);
         assert_eq!(result.drawdown_pct, dec!(0.03));
@@ -1291,5 +1345,3 @@ mod tests {
         assert_eq!(stats.current_equity, dec!(10500));
     }
 }
-
-

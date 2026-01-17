@@ -363,11 +363,7 @@ async fn main() -> Result<()> {
             error!("🚨 [RISK] Trading halted due to detected malfunction!");
             // Log active alerts
             for alert in risk_orchestrator.get_active_alerts() {
-                error!(
-                    "   Alert: {} - {:?}",
-                    alert.message,
-                    alert.malfunction_type
-                );
+                error!("   Alert: {} - {:?}", alert.message, alert.malfunction_type);
             }
             // Wait longer before retrying
             tokio::time::sleep(Duration::from_secs(300)).await;
@@ -407,7 +403,10 @@ async fn main() -> Result<()> {
             info!(
                 "📊 [POSITIONS] current_positions ({} entries): {:?}",
                 current_positions.len(),
-                current_positions.iter().map(|(k, v)| format!("{}=${:.2}", k, v)).collect::<Vec<_>>()
+                current_positions
+                    .iter()
+                    .map(|(k, v)| format!("{}=${:.2}", k, v))
+                    .collect::<Vec<_>>()
             );
 
             let allocations = allocator.calculate_allocation(
@@ -449,7 +448,8 @@ async fn main() -> Result<()> {
                         let current_position_qty = current_positions
                             .get(&alloc.symbol)
                             .copied()
-                            .unwrap_or(Decimal::ZERO) / price;
+                            .unwrap_or(Decimal::ZERO)
+                            / price;
 
                         // Calculate target quantity
                         let target_qty = (alloc.target_size_usdt / price).round_dp(4);
@@ -510,7 +510,10 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        info!("📈 [EXECUTE] Entering NEW position: {} (qty: {:.4})", alloc.symbol, target_qty);
+                        info!(
+                            "📈 [EXECUTE] Entering NEW position: {} (qty: {:.4})",
+                            alloc.symbol, target_qty
+                        );
 
                         // Calculate quantity - only enter new positions, not adjustments
                         let quantity = target_qty;
@@ -734,7 +737,10 @@ async fn main() -> Result<()> {
                     let prices = fetch_prices(&real_client, &qualified_pairs).await;
 
                     for reduction in &reductions {
-                        let price = prices.get(&reduction.symbol).copied().unwrap_or(dec!(50000));
+                        let price = prices
+                            .get(&reduction.symbol)
+                            .copied()
+                            .unwrap_or(dec!(50000));
                         let reduction_qty = (reduction.reduction_usdt / price).round_dp(4);
 
                         if reduction_qty <= Decimal::ZERO {
@@ -777,10 +783,16 @@ async fn main() -> Result<()> {
 
                         match mock_client.place_futures_order(&futures_order).await {
                             Ok(_) => {
-                                info!("✅ [REDUCE] Reduced futures position for {}", reduction.symbol);
+                                info!(
+                                    "✅ [REDUCE] Reduced futures position for {}",
+                                    reduction.symbol
+                                );
                             }
                             Err(e) => {
-                                error!("❌ [REDUCE] Failed to reduce futures for {}: {}", reduction.symbol, e);
+                                error!(
+                                    "❌ [REDUCE] Failed to reduce futures for {}: {}",
+                                    reduction.symbol, e
+                                );
                                 metrics.errors_count += 1;
                                 continue;
                             }
@@ -812,7 +824,10 @@ async fn main() -> Result<()> {
 
                         match mock_client.place_margin_order(&spot_order).await {
                             Ok(_) => {
-                                info!("✅ [REDUCE] Reduced spot position for {}", reduction.spot_symbol);
+                                info!(
+                                    "✅ [REDUCE] Reduced spot position for {}",
+                                    reduction.spot_symbol
+                                );
                                 metrics.rebalances_triggered += 1;
                             }
                             Err(e) => {
@@ -827,9 +842,15 @@ async fn main() -> Result<()> {
                     let positions = real_client.get_positions().await.unwrap_or_default();
 
                     for reduction in &reductions {
-                        let price = prices.get(&reduction.symbol).copied().unwrap_or(Decimal::ZERO);
+                        let price = prices
+                            .get(&reduction.symbol)
+                            .copied()
+                            .unwrap_or(Decimal::ZERO);
                         if price == Decimal::ZERO {
-                            warn!("Skipping reduction for {} due to missing price", reduction.symbol);
+                            warn!(
+                                "Skipping reduction for {} due to missing price",
+                                reduction.symbol
+                            );
                             continue;
                         }
 
@@ -839,13 +860,19 @@ async fn main() -> Result<()> {
                             .map(|p| p.position_amt)
                             .unwrap_or(Decimal::ZERO);
 
-                        match executor.reduce_position(&real_client, reduction, price, futures_position).await {
+                        match executor
+                            .reduce_position(&real_client, reduction, price, futures_position)
+                            .await
+                        {
                             Ok(result) => {
                                 if result.success {
                                     info!("✅ [REDUCE] Reduced position for {}", result.symbol);
                                     metrics.rebalances_triggered += 1;
                                 } else {
-                                    error!("❌ [REDUCE] Failed to reduce {}: {:?}", result.symbol, result.error);
+                                    error!(
+                                        "❌ [REDUCE] Failed to reduce {}: {:?}",
+                                        result.symbol, result.error
+                                    );
                                     metrics.errors_count += 1;
                                 }
                             }
@@ -995,7 +1022,11 @@ async fn main() -> Result<()> {
                 info!("💸 [FUNDING] Collecting funding payments...");
                 let per_position_funding = mock_client.collect_funding().await;
                 let total_funding: Decimal = per_position_funding.values().sum();
-                info!("💸 [FUNDING] Received: ${:.4} across {} positions", total_funding, per_position_funding.len());
+                info!(
+                    "💸 [FUNDING] Received: ${:.4} across {} positions",
+                    total_funding,
+                    per_position_funding.len()
+                );
                 metrics.funding_collections += 1;
 
                 // Verify funding for each position using actual per-position data
@@ -1003,7 +1034,8 @@ async fn main() -> Result<()> {
                     if risk_orchestrator.get_tracked_position(symbol).is_some() {
                         // Record and verify funding with actual per-position amount
                         risk_orchestrator.record_funding(symbol, *actual_funding);
-                        let verification = risk_orchestrator.verify_funding(symbol, *actual_funding);
+                        let verification =
+                            risk_orchestrator.verify_funding(symbol, *actual_funding);
 
                         if verification.is_anomaly {
                             warn!(
@@ -1021,7 +1053,10 @@ async fn main() -> Result<()> {
             if trading_mode == TradingMode::Mock {
                 let state_to_save = mock_client.export_state().await;
                 if let Err(e) = persistence.save_state(&state_to_save) {
-                    warn!("⚠️  [PERSISTENCE] Failed to save state after funding: {}", e);
+                    warn!(
+                        "⚠️  [PERSISTENCE] Failed to save state after funding: {}",
+                        e
+                    );
                 } else {
                     debug!("💾 [PERSISTENCE] State saved after funding collection");
                 }
@@ -1071,7 +1106,12 @@ async fn main() -> Result<()> {
             // Run comprehensive risk check
             // Mock mode: use default maintenance rate since we don't have real leverage brackets
             let maintenance_rates: HashMap<String, Decimal> = HashMap::new();
-            let risk_result = risk_orchestrator.check_all(&exchange_positions, total_equity, state.balance, &maintenance_rates);
+            let risk_result = risk_orchestrator.check_all(
+                &exchange_positions,
+                total_equity,
+                state.balance,
+                &maintenance_rates,
+            );
 
             // Check for drawdown warnings
             let drawdown_stats = risk_orchestrator.get_drawdown_stats();
@@ -1089,7 +1129,8 @@ async fn main() -> Result<()> {
                 // Graduated response based on distance to limit
                 let distance_pct = distance / max_drawdown;
 
-                if distance_pct <= dec!(0.05) { // Within 5% of limit (95% threshold)
+                if distance_pct <= dec!(0.05) {
+                    // Within 5% of limit (95% threshold)
                     warn!("🚨 Drawdown at 95% of limit - reducing all positions by 25%");
 
                     for pos in &positions {
@@ -1119,7 +1160,10 @@ async fn main() -> Result<()> {
                         };
 
                         if let Err(e) = mock_client.place_futures_order(&futures_order).await {
-                            error!("❌ Failed to reduce futures position for {}: {}", pos.symbol, e);
+                            error!(
+                                "❌ Failed to reduce futures position for {}: {}",
+                                pos.symbol, e
+                            );
                         } else {
                             info!("✅ Reduced futures position for {} by 25%", pos.symbol);
                         }
@@ -1140,17 +1184,23 @@ async fn main() -> Result<()> {
                                 price: None,
                                 time_in_force: None,
                                 is_isolated: Some(false),
-                                side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
+                                side_effect_type: Some(
+                                    funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                                ),
                             };
 
                             if let Err(e) = mock_client.place_margin_order(&spot_order).await {
-                                error!("❌ Failed to reduce spot position for {}: {}", pos.spot_symbol, e);
+                                error!(
+                                    "❌ Failed to reduce spot position for {}: {}",
+                                    pos.spot_symbol, e
+                                );
                             } else {
                                 info!("✅ Reduced spot position for {} by 25%", pos.spot_symbol);
                             }
                         }
                     }
-                } else if distance_pct <= dec!(0.10) { // Within 10% of limit (90% threshold)
+                } else if distance_pct <= dec!(0.10) {
+                    // Within 10% of limit (90% threshold)
                     warn!("⚠️  Drawdown at 90% of limit - stopping new positions");
                     // Note: New position logic would need to check this condition
                     // For now, just log the warning
@@ -1176,7 +1226,7 @@ async fn main() -> Result<()> {
 
                             // Automatic position reduction for margin health warnings
                             let reduction_pct = match health {
-                                MarginHealth::Red => Some(dec!(0.50)),    // 50% reduction for critical
+                                MarginHealth::Red => Some(dec!(0.50)), // 50% reduction for critical
                                 MarginHealth::Orange => Some(dec!(0.25)), // 25% reduction for warning
                                 _ => None,
                             };
@@ -1213,7 +1263,11 @@ async fn main() -> Result<()> {
 
                                     match mock_client.place_futures_order(&futures_order).await {
                                         Ok(_) => {
-                                            info!("✅ [AUTO-REDUCE] Reduced futures {} by {}%", pos.symbol, pct * dec!(100));
+                                            info!(
+                                                "✅ [AUTO-REDUCE] Reduced futures {} by {}%",
+                                                pos.symbol,
+                                                pct * dec!(100)
+                                            );
                                             metrics.rebalances_triggered += 1;
                                         }
                                         Err(e) => {
@@ -1241,16 +1295,29 @@ async fn main() -> Result<()> {
                                             side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
                                         };
 
-                                        if let Err(e) = mock_client.place_margin_order(&spot_order).await {
-                                            error!("❌ [AUTO-REDUCE] Spot reduction failed for {}: {}", pos.spot_symbol, e);
+                                        if let Err(e) =
+                                            mock_client.place_margin_order(&spot_order).await
+                                        {
+                                            error!(
+                                                "❌ [AUTO-REDUCE] Spot reduction failed for {}: {}",
+                                                pos.spot_symbol, e
+                                            );
                                         } else {
-                                            info!("✅ [AUTO-REDUCE] Reduced spot {} by {}%", pos.spot_symbol, pct * dec!(100));
+                                            info!(
+                                                "✅ [AUTO-REDUCE] Reduced spot {} by {}%",
+                                                pos.spot_symbol,
+                                                pct * dec!(100)
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
-                        RiskAlertType::PositionLoss { symbol, reason, hours } => {
+                        RiskAlertType::PositionLoss {
+                            symbol,
+                            reason,
+                            hours,
+                        } => {
                             warn!(
                                 "⚠️  [RISK] Position {} unprofitable: {} ({}h)",
                                 symbol, reason, hours
@@ -1271,10 +1338,19 @@ async fn main() -> Result<()> {
 
                             // Automatic position reduction for liquidation risk
                             match action {
-                                LiquidationAction::ReducePosition { symbol, reduction_pct } => {
-                                    info!("🤖 [AUTO-REDUCE] Executing {}% reduction for {}", reduction_pct * dec!(100), symbol);
+                                LiquidationAction::ReducePosition {
+                                    symbol,
+                                    reduction_pct,
+                                } => {
+                                    info!(
+                                        "🤖 [AUTO-REDUCE] Executing {}% reduction for {}",
+                                        reduction_pct * dec!(100),
+                                        symbol
+                                    );
 
-                                    if let Some(pos) = positions.iter().find(|p| &p.symbol == symbol) {
+                                    if let Some(pos) =
+                                        positions.iter().find(|p| &p.symbol == symbol)
+                                    {
                                         let reduce_qty = pos.futures_qty.abs() * *reduction_pct;
 
                                         if reduce_qty >= dec!(0.0001) {
@@ -1297,7 +1373,10 @@ async fn main() -> Result<()> {
                                                 new_client_order_id: None,
                                             };
 
-                                            match mock_client.place_futures_order(&futures_order).await {
+                                            match mock_client
+                                                .place_futures_order(&futures_order)
+                                                .await
+                                            {
                                                 Ok(_) => {
                                                     info!("✅ [AUTO-REDUCE] Reduced futures {} by {}%", symbol, reduction_pct * dec!(100));
                                                     metrics.rebalances_triggered += 1;
@@ -1309,7 +1388,8 @@ async fn main() -> Result<()> {
                                             }
 
                                             // Close matching spot position
-                                            let spot_reduce_qty = pos.spot_qty.abs() * *reduction_pct;
+                                            let spot_reduce_qty =
+                                                pos.spot_qty.abs() * *reduction_pct;
                                             if spot_reduce_qty >= dec!(0.0001) {
                                                 let spot_side = if pos.spot_qty > Decimal::ZERO {
                                                     funding_fee_farmer::exchange::OrderSide::Sell
@@ -1328,17 +1408,27 @@ async fn main() -> Result<()> {
                                                     side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
                                                 };
 
-                                                if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                                                if let Err(e) = mock_client
+                                                    .place_margin_order(&spot_order)
+                                                    .await
+                                                {
                                                     error!("❌ [AUTO-REDUCE] Spot reduction failed for {}: {}", pos.spot_symbol, e);
                                                 } else {
-                                                    info!("✅ [AUTO-REDUCE] Reduced spot {} by {}%", pos.spot_symbol, reduction_pct * dec!(100));
+                                                    info!(
+                                                        "✅ [AUTO-REDUCE] Reduced spot {} by {}%",
+                                                        pos.spot_symbol,
+                                                        reduction_pct * dec!(100)
+                                                    );
                                                 }
                                             }
                                         }
                                     }
                                 }
                                 LiquidationAction::ClosePosition { symbol } => {
-                                    warn!("🤖 [AUTO-CLOSE] Position {} flagged for emergency close", symbol);
+                                    warn!(
+                                        "🤖 [AUTO-CLOSE] Position {} flagged for emergency close",
+                                        symbol
+                                    );
                                     // This will be handled by positions_to_close below
                                 }
                                 _ => {}
@@ -1357,7 +1447,10 @@ async fn main() -> Result<()> {
 
             // Handle positions to close
             for symbol in &risk_result.positions_to_close {
-                warn!("🚨 [RISK] Position {} flagged for closure by risk orchestrator", symbol);
+                warn!(
+                    "🚨 [RISK] Position {} flagged for closure by risk orchestrator",
+                    symbol
+                );
 
                 // Find position data for this symbol
                 if let Some(pos) = positions.iter().find(|p| &p.symbol == symbol) {
@@ -1411,7 +1504,9 @@ async fn main() -> Result<()> {
                             price: None,
                             time_in_force: None,
                             is_isolated: Some(false),
-                            side_effect_type: Some(funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay),
+                            side_effect_type: Some(
+                                funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                            ),
                         };
 
                         if let Err(e) = mock_client.place_margin_order(&spot_order).await {
@@ -1427,15 +1522,20 @@ async fn main() -> Result<()> {
                     } else {
                         error!(
                             "❌ [RISK] Failed to close position {}: {}",
-                            symbol, close_errors.join("; ")
+                            symbol,
+                            close_errors.join("; ")
                         );
                         risk_orchestrator.record_error(&format!(
                             "Position close failed for {}: {}",
-                            symbol, close_errors.join("; ")
+                            symbol,
+                            close_errors.join("; ")
                         ));
                     }
                 } else {
-                    warn!("⚠️  [RISK] Position {} not found in active positions", symbol);
+                    warn!(
+                        "⚠️  [RISK] Position {} not found in active positions",
+                        symbol
+                    );
                 }
             }
 
@@ -1464,24 +1564,31 @@ async fn main() -> Result<()> {
                     .map(|b| b.wallet_balance + b.unrealized_profit)
                     .sum();
 
-                let margin_balance: Decimal = balances
-                    .iter()
-                    .map(|b| b.wallet_balance)
-                    .sum();
+                let margin_balance: Decimal = balances.iter().map(|b| b.wallet_balance).sum();
 
                 // Get positions for live mode
                 let live_positions = match real_client.get_positions().await {
-                    Ok(pos) => pos.into_iter().filter(|p| p.position_amt != Decimal::ZERO).collect(),
+                    Ok(pos) => pos
+                        .into_iter()
+                        .filter(|p| p.position_amt != Decimal::ZERO)
+                        .collect(),
                     Err(_) => vec![],
                 };
 
                 // Build maintenance rate map from leverage brackets
                 let maintenance_rates = match real_client.get_leverage_brackets().await {
-                    Ok(brackets) => MarginMonitor::build_maintenance_rate_map(&brackets, &live_positions),
+                    Ok(brackets) => {
+                        MarginMonitor::build_maintenance_rate_map(&brackets, &live_positions)
+                    }
                     Err(_) => HashMap::new(), // Fallback to default rates
                 };
 
-                let risk_result = risk_orchestrator.check_all(&live_positions, total_equity, margin_balance, &maintenance_rates);
+                let risk_result = risk_orchestrator.check_all(
+                    &live_positions,
+                    total_equity,
+                    margin_balance,
+                    &maintenance_rates,
+                );
 
                 if risk_result.should_halt {
                     error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");
@@ -1779,13 +1886,14 @@ fn log_status_with_risk(
         info!("╠════════════════════════════════════════════════════════════╣");
         for pos in &tracked_positions {
             let net_pnl = pos.net_pnl();
-            let status = if net_pnl >= Decimal::ZERO { "✅" } else { "⚠️" };
+            let status = if net_pnl >= Decimal::ZERO {
+                "✅"
+            } else {
+                "⚠️"
+            };
             info!(
                 "║ {} {:12} | Fund: ${:>8.4} | Net: ${:>8.4}          ",
-                status,
-                pos.symbol,
-                pos.total_funding_received,
-                net_pnl
+                status, pos.symbol, pos.total_funding_received, net_pnl
             );
         }
         info!("╚════════════════════════════════════════════════════════════╝");
@@ -1821,18 +1929,28 @@ fn show_status(db_path: &str, verbose: bool) -> Result<()> {
     } else {
         Decimal::ZERO
     };
-    let net_yield = state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
+    let net_yield =
+        state.total_funding_received - state.total_trading_fees - state.total_borrow_interest;
 
     println!("\n📊 Account Summary");
     println!("   ├─ Initial Balance:  ${:.2}", state.initial_balance);
     println!("   ├─ Current Balance:  ${:.2}", state.balance);
     println!("   ├─ PnL:              ${:.2} ({:+.2}%)", pnl, pnl_pct);
-    println!("   └─ Last Updated:     {}", state.last_saved.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "   └─ Last Updated:     {}",
+        state.last_saved.format("%Y-%m-%d %H:%M:%S UTC")
+    );
 
     println!("\n💰 Funding & Costs");
-    println!("   ├─ Total Funding:    ${:.4}", state.total_funding_received);
+    println!(
+        "   ├─ Total Funding:    ${:.4}",
+        state.total_funding_received
+    );
     println!("   ├─ Trading Fees:     ${:.4}", state.total_trading_fees);
-    println!("   ├─ Borrow Interest:  ${:.4}", state.total_borrow_interest);
+    println!(
+        "   ├─ Borrow Interest:  ${:.4}",
+        state.total_borrow_interest
+    );
     println!("   └─ Net Yield:        ${:.4}", net_yield);
 
     println!("\n📈 Activity");
@@ -1844,23 +1962,38 @@ fn show_status(db_path: &str, verbose: bool) -> Result<()> {
         for (symbol, pos) in &state.positions {
             let pos_pnl = pos.total_funding_received - pos.total_interest_paid;
             println!("   ┌─ {}", symbol);
-            println!("   ├─ Futures: {} @ ${:.2}", pos.futures_qty, pos.futures_entry_price);
-            println!("   ├─ Spot:    {} @ ${:.2}", pos.spot_qty, pos.spot_entry_price);
+            println!(
+                "   ├─ Futures: {} @ ${:.2}",
+                pos.futures_qty, pos.futures_entry_price
+            );
+            println!(
+                "   ├─ Spot:    {} @ ${:.2}",
+                pos.spot_qty, pos.spot_entry_price
+            );
             if pos.borrowed_amount > Decimal::ZERO {
                 println!("   ├─ Borrowed: ${:.2}", pos.borrowed_amount);
             }
-            println!("   ├─ Funding Collected: ${:.4} ({} times)", pos.total_funding_received, pos.funding_collections);
+            println!(
+                "   ├─ Funding Collected: ${:.4} ({} times)",
+                pos.total_funding_received, pos.funding_collections
+            );
             if pos.total_interest_paid > Decimal::ZERO {
                 println!("   ├─ Interest Paid:    ${:.4}", pos.total_interest_paid);
             }
             println!("   ├─ Net P/L:          ${:.4}", pos_pnl);
-            println!("   └─ Opened:           {}", pos.opened_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!(
+                "   └─ Opened:           {}",
+                pos.opened_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
 
             if verbose {
                 let duration = Utc::now() - pos.opened_at;
                 let hours = duration.num_hours();
                 let funding_periods = hours / 8;
-                println!("       Duration: {}h ({} funding periods)", hours, funding_periods);
+                println!(
+                    "       Duration: {}h ({} funding periods)",
+                    hours, funding_periods
+                );
             }
         }
     }
@@ -2005,7 +2138,10 @@ async fn run_sweep(
         ParameterSpace::default()
     };
 
-    info!("   Combinations to test: {}", param_space.combination_count());
+    info!(
+        "   Combinations to test: {}",
+        param_space.combination_count()
+    );
 
     // Create backtest config
     let backtest_config = BacktestConfig {

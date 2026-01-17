@@ -108,7 +108,9 @@ impl BinanceClient {
                     let status = response.status();
 
                     // Success or non-retryable client error
-                    if status.is_success() || (status.is_client_error() && !is_retryable_status(status)) {
+                    if status.is_success()
+                        || (status.is_client_error() && !is_retryable_status(status))
+                    {
                         return Ok(response);
                     }
 
@@ -146,13 +148,19 @@ impl BinanceClient {
                     }
 
                     // Non-retryable error or exhausted retries
-                    return Err(anyhow!("{} failed after {} attempts: {}", operation, attempt, e));
+                    return Err(anyhow!(
+                        "{} failed after {} attempts: {}",
+                        operation,
+                        attempt,
+                        e
+                    ));
                 }
             }
         }
 
         // Exhausted all retries
-        Err(last_error.unwrap_or_else(|| anyhow!("{} failed after {} retries", operation, MAX_RETRIES)))
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("{} failed after {} retries", operation, MAX_RETRIES)))
     }
 
     // ==================== Market Data (Public) ====================

@@ -31,10 +31,7 @@ pub enum MalfunctionType {
         consecutive_failures: u32,
     },
     /// Delta drift exceeded emergency threshold
-    DeltaDriftEmergency {
-        symbol: String,
-        drift_pct: Decimal,
-    },
+    DeltaDriftEmergency { symbol: String, drift_pct: Decimal },
     /// Balance mismatch between expected and actual
     BalanceDiscrepancy {
         expected: Decimal,
@@ -48,13 +45,9 @@ pub enum MalfunctionType {
         actual: Decimal,
     },
     /// Rate limit hit on API
-    RateLimitHit {
-        endpoint: String,
-    },
+    RateLimitHit { endpoint: String },
     /// WebSocket connection issues
-    WebSocketDisconnect {
-        duration_secs: u64,
-    },
+    WebSocketDisconnect { duration_secs: u64 },
 }
 
 /// Severity levels for alerts.
@@ -100,11 +93,7 @@ impl MalfunctionAlert {
         suggested_action: String,
     ) -> Self {
         let timestamp = Utc::now();
-        let alert_id = format!(
-            "malfunction-{}-{}",
-            timestamp.timestamp(),
-            rand_suffix()
-        );
+        let alert_id = format!("malfunction-{}-{}", timestamp.timestamp(), rand_suffix());
 
         Self {
             alert_id,
@@ -289,7 +278,11 @@ impl MalfunctionDetector {
     }
 
     /// Check delta drift and alert if emergency.
-    pub fn check_delta_drift(&mut self, symbol: &str, drift_pct: Decimal) -> Option<MalfunctionAlert> {
+    pub fn check_delta_drift(
+        &mut self,
+        symbol: &str,
+        drift_pct: Decimal,
+    ) -> Option<MalfunctionAlert> {
         if drift_pct.abs() >= self.config.emergency_delta_drift {
             let alert = MalfunctionAlert::new(
                 MalfunctionType::DeltaDriftEmergency {

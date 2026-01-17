@@ -6,7 +6,7 @@
 //! - Net PnL calculation
 //! - Loss detection and exit recommendations
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Serialize;
@@ -186,7 +186,10 @@ pub enum PositionAction {
     /// Position needs close monitoring.
     MonitorClosely { reason: String },
     /// Position should be considered for exit.
-    ConsiderExit { reason: String, hours_unprofitable: u32 },
+    ConsiderExit {
+        reason: String,
+        hours_unprofitable: u32,
+    },
     /// Position must be closed immediately.
     ForceExit { reason: String },
 }
@@ -346,7 +349,8 @@ impl PositionTracker {
 
         // Check if position is unprofitable
         if net_pnl < Decimal::ZERO {
-            pos.hours_unprofitable = (pos.hours_open - self.config.grace_period_hours as f64).max(0.0) as u32;
+            pos.hours_unprofitable =
+                (pos.hours_open - self.config.grace_period_hours as f64).max(0.0) as u32;
 
             // Force exit if unprofitable for too long
             if pos.hours_unprofitable >= self.config.max_unprofitable_hours {
@@ -385,10 +389,7 @@ impl PositionTracker {
         if let Some(efficiency) = pos.funding_efficiency() {
             if efficiency < dec!(1) - self.config.max_funding_deviation {
                 return PositionAction::MonitorClosely {
-                    reason: format!(
-                        "Funding efficiency low: {:.1}%",
-                        efficiency * dec!(100)
-                    ),
+                    reason: format!("Funding efficiency low: {:.1}%", efficiency * dec!(100)),
                 };
             }
         }
@@ -455,6 +456,91 @@ impl PositionTracker {
     pub fn position_count(&self) -> usize {
         self.positions.len()
     }
+
+    /// Get aggregate metrics across all positions for monitoring.
+    pub fn get_aggregate_metrics(&self) -> AggregateMetrics {
+        let mut total_funding_received = Decimal::ZERO;
+        let mut total_interest_paid = Decimal::ZERO;
+        let mut total_fees = Decimal::ZERO;
+        let mut total_net_pnl = Decimal::ZERO;
+        let mut total_position_value = Decimal::ZERO;
+        let mut profitable_count = 0usize;
+        let mut unprofitable_count = 0usize;
+
+        for pos in self.positions.values() {
+            total_funding_received += pos.total_funding_received;
+            total_interest_paid += pos.interest_paid;
+            total_fees += pos.entry_fees + pos.rebalance_fees;
+            total_net_pnl += pos.net_pnl();
+            total_position_value += pos.position_value;
+
+            if pos.is_profitable() {
+                profitable_count += 1;
+            } else if !pos.in_grace_period(self.config.grace_period_hours) {
+                unprofitable_count += 1;
+            }
+        }
+
+        AggregateMetrics {
+            position_count: self.positions.len(),
+            profitable_count,
+            unprofitable_count,
+            total_position_value,
+            total_funding_received,
+            total_interest_paid,
+            total_fees,
+            total_net_pnl,
+            net_yield_pct: if total_position_value > Decimal::ZERO {
+                (total_net_pnl / total_position_value) * dec!(100)
+            } else {
+                Decimal::ZERO
+            },
+        }
+    }
+
+    /// Log aggregate profitability summary (call periodically for monitoring).
+    pub fn log_profitability_summary(&self) {
+        let metrics = self.get_aggregate_metrics();
+
+        if metrics.position_count == 0 {
+            return;
+        }
+
+        info!(
+            position_count = metrics.position_count,
+            profitable = metrics.profitable_count,
+            unprofitable = metrics.unprofitable_count,
+            total_value = %metrics.total_position_value,
+            funding_received = %metrics.total_funding_received,
+            interest_paid = %metrics.total_interest_paid,
+            total_fees = %metrics.total_fees,
+            net_pnl = %metrics.total_net_pnl,
+            net_yield_pct = %metrics.net_yield_pct,
+            "📊 Portfolio profitability summary"
+        );
+
+        // Warn if overall portfolio is unprofitable
+        if metrics.total_net_pnl < Decimal::ZERO {
+            warn!(
+                net_pnl = %metrics.total_net_pnl,
+                "⚠️  Overall portfolio is currently unprofitable"
+            );
+        }
+    }
+}
+
+/// Aggregate metrics across all tracked positions.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregateMetrics {
+    pub position_count: usize,
+    pub profitable_count: usize,
+    pub unprofitable_count: usize,
+    pub total_position_value: Decimal,
+    pub total_funding_received: Decimal,
+    pub total_interest_paid: Decimal,
+    pub total_fees: Decimal,
+    pub total_net_pnl: Decimal,
+    pub net_yield_pct: Decimal,
 }
 
 #[cfg(test)]

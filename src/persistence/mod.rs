@@ -9,8 +9,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension};
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -262,7 +262,8 @@ impl PersistenceManager {
                     symbol.clone(),
                     PersistedPosition {
                         symbol,
-                        futures_qty: Decimal::from_str(&row.get::<_, String>(1)?).unwrap_or_default(),
+                        futures_qty: Decimal::from_str(&row.get::<_, String>(1)?)
+                            .unwrap_or_default(),
                         futures_entry_price: Decimal::from_str(&row.get::<_, String>(2)?)
                             .unwrap_or_default(),
                         spot_qty: Decimal::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),

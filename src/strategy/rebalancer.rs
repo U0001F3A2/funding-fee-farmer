@@ -23,7 +23,7 @@ pub struct RebalanceConfig {
 impl Default for RebalanceConfig {
     fn default() -> Self {
         Self {
-            max_delta_drift: dec!(0.03), // 3% drift triggers rebalance
+            max_delta_drift: dec!(0.03),   // 3% drift triggers rebalance
             min_rebalance_size: dec!(100), // Min $100 trade
             auto_flip_on_reversal: true,
         }
@@ -138,7 +138,8 @@ impl HedgeRebalancer {
         // Check if funding rate has flipped significantly
         if self.config.auto_flip_on_reversal
             && current_funding_direction != expected_direction
-            && current_funding_rate.abs() > dec!(0.0001) // Only flip if new rate is meaningful
+            && current_funding_rate.abs() > dec!(0.0001)
+        // Only flip if new rate is meaningful
         {
             warn!(
                 symbol = %position.symbol,
@@ -225,7 +226,11 @@ impl HedgeRebalancer {
                 error: None,
             }),
 
-            RebalanceAction::AdjustSpot { symbol, side, quantity } => {
+            RebalanceAction::AdjustSpot {
+                symbol,
+                side,
+                quantity,
+            } => {
                 info!(
                     %symbol,
                     side = ?side,
@@ -264,7 +269,11 @@ impl HedgeRebalancer {
                 }
             }
 
-            RebalanceAction::AdjustFutures { symbol, side, quantity } => {
+            RebalanceAction::AdjustFutures {
+                symbol,
+                side,
+                quantity,
+            } => {
                 info!(
                     %symbol,
                     side = ?side,
@@ -304,7 +313,10 @@ impl HedgeRebalancer {
                 }
             }
 
-            RebalanceAction::FlipPosition { symbol, new_funding_direction } => {
+            RebalanceAction::FlipPosition {
+                symbol,
+                new_funding_direction,
+            } => {
                 warn!(
                     %symbol,
                     direction = ?new_funding_direction,
@@ -322,7 +334,12 @@ impl HedgeRebalancer {
                 })
             }
 
-            RebalanceAction::ClosePosition { symbol, spot_symbol, futures_qty, spot_qty } => {
+            RebalanceAction::ClosePosition {
+                symbol,
+                spot_symbol,
+                futures_qty,
+                spot_qty,
+            } => {
                 info!(
                     %symbol,
                     %spot_symbol,
@@ -499,7 +516,11 @@ mod tests {
             spot_qty,
             spot_entry_price: dec!(50000),
             net_delta: futures_qty + spot_qty, // Simplified: positive = long exposure
-            borrowed_amount: if spot_qty < Decimal::ZERO { spot_qty.abs() } else { Decimal::ZERO },
+            borrowed_amount: if spot_qty < Decimal::ZERO {
+                spot_qty.abs()
+            } else {
+                Decimal::ZERO
+            },
             funding_pnl: Decimal::ZERO,
             interest_paid: Decimal::ZERO,
         }

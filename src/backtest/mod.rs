@@ -24,9 +24,7 @@ mod engine;
 mod metrics;
 mod runner;
 
-pub use data::{
-    CsvDataLoader, DataLoader, LiveDataCollector, MarketSnapshot, SymbolData,
-};
+pub use data::{CsvDataLoader, DataLoader, LiveDataCollector, MarketSnapshot, SymbolData};
 pub use engine::{BacktestEngine, BacktestResult, StepResult};
 pub use metrics::{BacktestMetrics, EquityPoint};
 pub use runner::{ParameterSpace, SweepResults, SweepRunner};
@@ -91,11 +89,7 @@ pub fn next_funding_time(from: DateTime<Utc>) -> DateTime<Utc> {
 
     match next_hour {
         Some(h) if h == hour && minute == 0 => from, // Already at funding time
-        Some(h) => from
-            .date_naive()
-            .and_hms_opt(h, 0, 0)
-            .unwrap()
-            .and_utc(),
+        Some(h) => from.date_naive().and_hms_opt(h, 0, 0).unwrap().and_utc(),
         None => {
             // Next day at 00:00
             (from + Duration::days(1))

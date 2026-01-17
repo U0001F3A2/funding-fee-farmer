@@ -478,10 +478,10 @@ mod tests {
     fn test_equity_point_drawdown() {
         let point = EquityPoint::new(
             Utc::now(),
-            dec!(9500),    // balance
-            dec!(0),       // unrealized
-            2,             // positions
-            dec!(10000),   // peak
+            dec!(9500),  // balance
+            dec!(0),     // unrealized
+            2,           // positions
+            dec!(10000), // peak
         );
 
         assert_eq!(point.total_equity, dec!(9500));
@@ -492,10 +492,10 @@ mod tests {
     fn test_equity_point_no_drawdown() {
         let point = EquityPoint::new(
             Utc::now(),
-            dec!(10000),   // balance = peak
+            dec!(10000), // balance = peak
             dec!(0),
             1,
-            dec!(10000),   // peak
+            dec!(10000), // peak
         );
 
         assert_eq!(point.drawdown, Decimal::ZERO);
@@ -505,14 +505,14 @@ mod tests {
     fn test_equity_point_with_unrealized_pnl() {
         let point = EquityPoint::new(
             Utc::now(),
-            dec!(9000),   // balance
-            dec!(500),    // unrealized profit
+            dec!(9000), // balance
+            dec!(500),  // unrealized profit
             2,
             dec!(10000),
         );
 
         assert_eq!(point.total_equity, dec!(9500)); // balance + unrealized
-        assert_eq!(point.drawdown, dec!(0.05));     // 5% from peak
+        assert_eq!(point.drawdown, dec!(0.05)); // 5% from peak
     }
 
     // =========================================================================
@@ -524,19 +524,31 @@ mod tests {
         let curve = vec![
             EquityPoint::new(
                 Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-                dec!(10000), dec!(0), 0, dec!(10000),
+                dec!(10000),
+                dec!(0),
+                0,
+                dec!(10000),
             ),
             EquityPoint::new(
                 Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
-                dec!(10500), dec!(0), 1, dec!(10500),
+                dec!(10500),
+                dec!(0),
+                1,
+                dec!(10500),
             ),
             EquityPoint::new(
                 Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap(),
-                dec!(9500), dec!(0), 1, dec!(10500),
+                dec!(9500),
+                dec!(0),
+                1,
+                dec!(10500),
             ),
             EquityPoint::new(
                 Utc.with_ymd_and_hms(2024, 1, 4, 0, 0, 0).unwrap(),
-                dec!(11000), dec!(0), 1, dec!(11000),
+                dec!(11000),
+                dec!(0),
+                1,
+                dec!(11000),
             ),
         ];
 
@@ -548,9 +560,7 @@ mod tests {
     #[test]
     fn test_max_drawdown_no_drawdown() {
         // Monotonically increasing equity
-        let curve = make_equity_curve(vec![
-            dec!(10000), dec!(10100), dec!(10200), dec!(10300),
-        ]);
+        let curve = make_equity_curve(vec![dec!(10000), dec!(10100), dec!(10200), dec!(10300)]);
 
         let (max_dd, _) = calculate_max_drawdown(&curve);
         assert_eq!(max_dd, Decimal::ZERO);
@@ -567,11 +577,11 @@ mod tests {
     fn test_max_drawdown_multiple_drawdowns() {
         // Two drawdowns: 5% then 10%
         let curve = make_equity_curve(vec![
-            dec!(10000),  // initial
-            dec!(9500),   // -5%
-            dec!(10500),  // new peak
-            dec!(9450),   // -10% from new peak
-            dec!(10000),  // recovery
+            dec!(10000), // initial
+            dec!(9500),  // -5%
+            dec!(10500), // new peak
+            dec!(9450),  // -10% from new peak
+            dec!(10000), // recovery
         ]);
 
         let (max_dd, _) = calculate_max_drawdown(&curve);
@@ -594,14 +604,18 @@ mod tests {
         let returns = calculate_period_returns(&curve);
         assert_eq!(returns.len(), 2);
         assert_eq!(returns[0], dec!(0.01)); // +1%
-        // returns[1] ≈ -0.99%
+                                            // returns[1] ≈ -0.99%
     }
 
     #[test]
     fn test_period_returns_single_point() {
-        let curve = vec![
-            EquityPoint::new(Utc::now(), dec!(10000), dec!(0), 0, dec!(10000)),
-        ];
+        let curve = vec![EquityPoint::new(
+            Utc::now(),
+            dec!(10000),
+            dec!(0),
+            0,
+            dec!(10000),
+        )];
 
         let returns = calculate_period_returns(&curve);
         assert!(returns.is_empty());
@@ -718,20 +732,18 @@ mod tests {
 
     #[test]
     fn test_metrics_calculate_basic() {
-        let curve = make_equity_curve(vec![
-            dec!(10000), dec!(10100), dec!(10200), dec!(10300),
-        ]);
+        let curve = make_equity_curve(vec![dec!(10000), dec!(10100), dec!(10200), dec!(10300)]);
 
         let metrics = BacktestMetrics::calculate(
             &curve,
-            dec!(10000),    // initial
-            dec!(500),      // funding
-            dec!(50),       // fees
-            dec!(25),       // interest
-            5,              // positions opened
-            4,              // positions closed
-            3,              // winning
-            100.0,          // total hours
+            dec!(10000), // initial
+            dec!(500),   // funding
+            dec!(50),    // fees
+            dec!(25),    // interest
+            5,           // positions opened
+            4,           // positions closed
+            3,           // winning
+            100.0,       // total hours
         );
 
         assert_eq!(metrics.total_return, dec!(300));
@@ -749,8 +761,13 @@ mod tests {
         let metrics = BacktestMetrics::calculate(
             &curve,
             dec!(10000),
-            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
-            10, 10, 7, 100.0,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            10,
+            10,
+            7,
+            100.0,
         );
 
         assert_eq!(metrics.win_rate, dec!(70)); // 70%
@@ -763,10 +780,13 @@ mod tests {
         let metrics = BacktestMetrics::calculate(
             &curve,
             dec!(10000),
-            dec!(600),  // funding
-            dec!(50),   // fees
-            dec!(50),   // interest
-            1, 1, 1, 10.0,
+            dec!(600), // funding
+            dec!(50),  // fees
+            dec!(50),  // interest
+            1,
+            1,
+            1,
+            10.0,
         );
 
         // funding / (fees + interest) = 600 / 100 = 6
@@ -778,8 +798,13 @@ mod tests {
         let metrics = BacktestMetrics::calculate(
             &[],
             dec!(10000),
-            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
-            0, 0, 0, 0.0,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            0,
+            0,
+            0,
+            0.0,
         );
 
         // Should return empty metrics
@@ -789,15 +814,18 @@ mod tests {
 
     #[test]
     fn test_metrics_calmar_ratio() {
-        let curve = make_equity_curve(vec![
-            dec!(10000), dec!(10200), dec!(9500), dec!(10500),
-        ]);
+        let curve = make_equity_curve(vec![dec!(10000), dec!(10200), dec!(9500), dec!(10500)]);
 
         let metrics = BacktestMetrics::calculate(
             &curve,
             dec!(10000),
-            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
-            1, 1, 1, 10.0,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            1,
+            1,
+            1,
+            10.0,
         );
 
         // Calmar = annualized_return / (max_drawdown * 100)

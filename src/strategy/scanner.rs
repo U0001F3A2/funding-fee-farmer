@@ -6,7 +6,19 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
+
+/// Reasons for rejecting a pair during qualification.
+#[derive(Debug, Clone, Copy)]
+enum RejectReason {
+    NotUsdt,
+    NoMargin,
+    NotBorrowable, // Can't short spot for negative funding
+    LowVolume,
+    WideSpread,
+    LowFunding,
+    MissingData,
+}
 
 /// Scans the market for profitable funding rate opportunities.
 pub struct MarketScanner {
@@ -57,7 +69,10 @@ impl MarketScanner {
         let margin_assets = match client.get_margin_all_assets().await {
             Ok(assets) => assets,
             Err(e) => {
-                warn!("Failed to fetch margin assets (may need API key): {}. Using empty list.", e);
+                warn!(
+                    "Failed to fetch margin assets (may need API key): {}. Using empty list.",
+                    e
+                );
                 Vec::new()
             }
         };
@@ -111,11 +126,40 @@ impl MarketScanner {
             .map(|a| (a.asset.clone(), a))
             .collect();
 
+        // Track rejection reasons for summary logging
+        let mut rejected_no_usdt = 0usize;
+        let mut rejected_no_margin = 0usize;
+        let mut rejected_not_borrowable = 0usize;
+        let mut rejected_low_volume = 0usize;
+        let mut rejected_wide_spread = 0usize;
+        let mut rejected_low_funding = 0usize;
+        let mut rejected_missing_data = 0usize;
+
         // Filter and score pairs
         let mut qualified: Vec<QualifiedPair> = funding_rates
             .iter()
             .filter_map(|fr| {
-                self.qualify_pair(fr, &volume_map, &spread_map, &spot_margin_map, &margin_asset_map)
+                match self.qualify_pair_with_reason(
+                    fr,
+                    &volume_map,
+                    &spread_map,
+                    &spot_margin_map,
+                    &margin_asset_map,
+                ) {
+                    Ok(pair) => Some(pair),
+                    Err(reason) => {
+                        match reason {
+                            RejectReason::NotUsdt => rejected_no_usdt += 1,
+                            RejectReason::NoMargin => rejected_no_margin += 1,
+                            RejectReason::NotBorrowable => rejected_not_borrowable += 1,
+                            RejectReason::LowVolume => rejected_low_volume += 1,
+                            RejectReason::WideSpread => rejected_wide_spread += 1,
+                            RejectReason::LowFunding => rejected_low_funding += 1,
+                            RejectReason::MissingData => rejected_missing_data += 1,
+                        }
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -123,43 +167,46 @@ impl MarketScanner {
         qualified.sort_by(|a, b| b.score.cmp(&a.score));
 
         let total_scanned = funding_rates.len();
-        let rejected_count = total_scanned - qualified.len();
         info!(
             total_scanned,
-            qualified_count = qualified.len(),
-            rejected_count,
+            qualified = qualified.len(),
+            rejected_no_usdt,
+            rejected_no_margin,
+            rejected_not_borrowable,
+            rejected_low_volume,
+            rejected_wide_spread,
+            rejected_low_funding,
+            rejected_missing_data,
             "Market scan complete"
         );
 
         Ok(qualified)
     }
 
-    /// Check if a pair qualifies and calculate its score.
-    /// A pair must have:
-    /// 1. USDT perpetual futures available
-    /// 2. Spot margin trading enabled for hedging
-    /// 3. Base asset borrowable (for shorting spot if needed)
-    /// 4. Sufficient volume, tight spread, and meaningful funding rate
-    fn qualify_pair(
+    /// Check if a pair qualifies and calculate its score, returning rejection reason if not.
+    fn qualify_pair_with_reason(
         &self,
         funding: &FundingRate,
         volume_map: &HashMap<String, Decimal>,
         spread_map: &HashMap<String, Decimal>,
         spot_margin_map: &HashMap<String, &SpotSymbolInfo>,
         margin_asset_map: &HashMap<String, &MarginAsset>,
-    ) -> Option<QualifiedPair> {
+    ) -> Result<QualifiedPair, RejectReason> {
         let symbol = &funding.symbol;
 
         // Must be USDT perpetual
         if !symbol.ends_with("USDT") {
-            return None;
+            return Err(RejectReason::NotUsdt);
         }
 
         // Derive spot symbol (same as futures for USDT pairs)
         let spot_symbol = symbol.clone();
 
         // Extract base asset (e.g., "BTC" from "BTCUSDT")
-        let base_asset = symbol.strip_suffix("USDT")?.to_string();
+        let base_asset = symbol
+            .strip_suffix("USDT")
+            .ok_or(RejectReason::NotUsdt)?
+            .to_string();
 
         // Check if spot margin trading is available
         let spot_info = spot_margin_map.get(&spot_symbol);
@@ -169,38 +216,44 @@ impl MarketScanner {
 
         if !margin_available {
             trace!(symbol, "No spot margin trading available - cannot hedge");
-            return None;
+            return Err(RejectReason::NoMargin);
         }
 
         // Check if base asset is borrowable (needed for shorting spot)
         let margin_asset = margin_asset_map.get(&base_asset);
         let borrow_rate = margin_asset.and_then(|a| a.margin_interest_rate);
 
-        if margin_asset.is_none() {
-            warn!(symbol, base_asset, "Base asset not borrowable - limited hedge options");
-            // Still allow if we can go long spot (for negative funding rates)
-            // but log a warning
+        // For negative funding rates, we need to short spot (borrow base asset)
+        // If the asset isn't borrowable, we can't properly hedge - reject the pair
+        if margin_asset.is_none() && funding.funding_rate < Decimal::ZERO {
+            trace!(
+                symbol,
+                base_asset,
+                funding_rate = %funding.funding_rate,
+                "Rejecting: negative funding requires borrowing, but asset not borrowable"
+            );
+            return Err(RejectReason::NotBorrowable);
         }
 
         // Get volume
-        let volume = *volume_map.get(symbol)?;
+        let volume = *volume_map.get(symbol).ok_or(RejectReason::MissingData)?;
         if volume < self.config.min_volume_24h {
             trace!(symbol, %volume, "Volume below threshold");
-            return None;
+            return Err(RejectReason::LowVolume);
         }
 
         // Get spread
-        let spread = *spread_map.get(symbol)?;
+        let spread = *spread_map.get(symbol).ok_or(RejectReason::MissingData)?;
         if spread > self.config.max_spread {
             trace!(symbol, %spread, "Spread above threshold");
-            return None;
+            return Err(RejectReason::WideSpread);
         }
 
         // Check funding rate magnitude
         let funding_rate_abs = funding.funding_rate.abs();
         if funding_rate_abs < self.config.min_funding_rate {
             trace!(symbol, %funding_rate_abs, "Funding rate below threshold");
-            return None;
+            return Err(RejectReason::LowFunding);
         }
 
         // Calculate net profitability considering borrow costs
@@ -210,8 +263,9 @@ impl MarketScanner {
             // Need to short spot, calculate borrow cost
             // Daily rate / 3 = 8-hour rate (funding settlement period)
             let daily_rate = borrow_rate.unwrap_or_else(|| {
-                let fallback = get_fallback_borrow_rate(&base_asset, self.config.default_borrow_rate);
-                debug!(
+                let fallback =
+                    get_fallback_borrow_rate(&base_asset, self.config.default_borrow_rate);
+                trace!(
                     symbol,
                     %base_asset,
                     %fallback,
@@ -231,7 +285,11 @@ impl MarketScanner {
         let funding_score = net_funding * dec!(10000); // Scale for comparison
         let volume_score = (volume / dec!(1_000_000_000)).min(dec!(1)); // Cap at 1B
         let spread_score = dec!(1) / (spread * dec!(10000) + dec!(1));
-        let margin_safety = if margin_asset.is_some() { dec!(1) } else { dec!(0.5) };
+        let margin_safety = if margin_asset.is_some() {
+            dec!(1)
+        } else {
+            dec!(0.5)
+        };
 
         let score = funding_score * dec!(0.5)
             + volume_score * dec!(0.25)
@@ -247,7 +305,7 @@ impl MarketScanner {
             "Pair qualified"
         );
 
-        Some(QualifiedPair {
+        Ok(QualifiedPair {
             symbol: symbol.clone(),
             spot_symbol,
             base_asset,
@@ -259,6 +317,30 @@ impl MarketScanner {
             borrow_rate,
             score,
         })
+    }
+
+    /// Check if a pair qualifies and calculate its score (legacy wrapper).
+    /// A pair must have:
+    /// 1. USDT perpetual futures available
+    /// 2. Spot margin trading enabled for hedging
+    /// 3. Base asset borrowable (for shorting spot if needed)
+    /// 4. Sufficient volume, tight spread, and meaningful funding rate
+    fn qualify_pair(
+        &self,
+        funding: &FundingRate,
+        volume_map: &HashMap<String, Decimal>,
+        spread_map: &HashMap<String, Decimal>,
+        spot_margin_map: &HashMap<String, &SpotSymbolInfo>,
+        margin_asset_map: &HashMap<String, &MarginAsset>,
+    ) -> Option<QualifiedPair> {
+        self.qualify_pair_with_reason(
+            funding,
+            volume_map,
+            spread_map,
+            spot_margin_map,
+            margin_asset_map,
+        )
+        .ok()
     }
 
     /// Get the next funding time for a symbol (in milliseconds since epoch).
@@ -347,8 +429,8 @@ mod tests {
     }
 
     fn setup_test_data() -> (
-        HashMap<String, Decimal>,       // volume_map
-        HashMap<String, Decimal>,       // spread_map
+        HashMap<String, Decimal>,        // volume_map
+        HashMap<String, Decimal>,        // spread_map
         HashMap<String, SpotSymbolInfo>, // spot_margin_map (owned)
         HashMap<String, MarginAsset>,    // margin_asset_map (owned)
     ) {
@@ -359,13 +441,16 @@ mod tests {
 
         let mut spread_map = HashMap::new();
         spread_map.insert("BTCUSDT".to_string(), dec!(0.00005)); // Very tight
-        spread_map.insert("ETHUSDT".to_string(), dec!(0.0001));  // Acceptable
+        spread_map.insert("ETHUSDT".to_string(), dec!(0.0001)); // Acceptable
         spread_map.insert("WIDESPREADUSDT".to_string(), dec!(0.001)); // Too wide
 
         let mut spot_map = HashMap::new();
         spot_map.insert("BTCUSDT".to_string(), make_spot_info("BTCUSDT", true));
         spot_map.insert("ETHUSDT".to_string(), make_spot_info("ETHUSDT", true));
-        spot_map.insert("NOMARGINUSDT".to_string(), make_spot_info("NOMARGINUSDT", false));
+        spot_map.insert(
+            "NOMARGINUSDT".to_string(),
+            make_spot_info("NOMARGINUSDT", false),
+        );
 
         let mut margin_map = HashMap::new();
         margin_map.insert("BTC".to_string(), make_margin_asset("BTC", dec!(0.001)));
@@ -412,8 +497,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_none(), "Should reject pair with volume below threshold");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_none(),
+            "Should reject pair with volume below threshold"
+        );
     }
 
     #[test]
@@ -428,8 +517,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_some(), "Should accept pair with sufficient volume");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_some(),
+            "Should accept pair with sufficient volume"
+        );
     }
 
     // =========================================================================
@@ -449,8 +542,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_none(), "Should reject pair with funding rate below threshold");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_none(),
+            "Should reject pair with funding rate below threshold"
+        );
     }
 
     #[test]
@@ -466,8 +563,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_some(), "Should accept negative funding rate with sufficient magnitude");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_some(),
+            "Should accept negative funding rate with sufficient magnitude"
+        );
     }
 
     // =========================================================================
@@ -489,8 +590,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_none(), "Should reject pair with spread above threshold");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_none(),
+            "Should reject pair with spread above threshold"
+        );
     }
 
     #[test]
@@ -499,7 +604,7 @@ mod tests {
         let bid = dec!(49990);
         let ask = dec!(50010);
         let mid = (bid + ask) / dec!(2); // 50000
-        let spread = (ask - bid) / mid;  // 20 / 50000 = 0.0004
+        let spread = (ask - bid) / mid; // 20 / 50000 = 0.0004
 
         assert_eq!(spread, dec!(0.0004));
     }
@@ -521,7 +626,8 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
 
         // BTC daily borrow rate = 0.001
         // 8-hour rate = 0.001 / 3 = 0.000333...
@@ -545,7 +651,8 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
 
         // Should qualify - no borrow cost subtracted
         assert!(result.is_some());
@@ -567,7 +674,8 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
         let pair = result.unwrap();
 
         // Verify score is reasonable
@@ -601,8 +709,20 @@ mod tests {
         let btc_funding = make_funding_rate("BTCUSDT", dec!(0.002)); // Higher
         let eth_funding = make_funding_rate("ETHUSDT", dec!(0.001)); // Lower
 
-        let btc_pair = scanner.qualify_pair(&btc_funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        let eth_pair = scanner.qualify_pair(&eth_funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let btc_pair = scanner.qualify_pair(
+            &btc_funding,
+            &volume_map,
+            &spread_map,
+            &spot_ref,
+            &margin_ref,
+        );
+        let eth_pair = scanner.qualify_pair(
+            &eth_funding,
+            &volume_map,
+            &spread_map,
+            &spot_ref,
+            &margin_ref,
+        );
 
         assert!(btc_pair.is_some());
         assert!(eth_pair.is_some());
@@ -631,8 +751,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_none(), "Should reject pair without margin trading");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_none(),
+            "Should reject pair without margin trading"
+        );
     }
 
     // =========================================================================
@@ -651,7 +775,8 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
         assert!(result.is_none(), "Should reject non-USDT pairs");
     }
 
@@ -667,7 +792,8 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
         let pair = result.unwrap();
 
         assert_eq!(pair.base_asset, "BTC");
@@ -691,8 +817,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_none(), "Should reject pair with missing volume data");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_none(),
+            "Should reject pair with missing volume data"
+        );
     }
 
     #[test]
@@ -711,8 +841,12 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
-        assert!(result.is_none(), "Should reject pair with missing spread data");
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        assert!(
+            result.is_none(),
+            "Should reject pair with missing spread data"
+        );
     }
 
     #[test]
@@ -727,7 +861,8 @@ mod tests {
         let margin_ref: HashMap<String, &MarginAsset> =
             margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-        let result = scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
         let pair = result.unwrap();
 
         assert_eq!(pair.symbol, "BTCUSDT");
@@ -749,28 +884,44 @@ mod tests {
     fn test_fallback_borrow_rate_tier1_btc() {
         let config_default = dec!(0.001);
         let rate = super::get_fallback_borrow_rate("BTC", config_default);
-        assert_eq!(rate, dec!(0.0003), "BTC should use tier 1 rate (0.03% daily)");
+        assert_eq!(
+            rate,
+            dec!(0.0003),
+            "BTC should use tier 1 rate (0.03% daily)"
+        );
     }
 
     #[test]
     fn test_fallback_borrow_rate_tier1_eth() {
         let config_default = dec!(0.001);
         let rate = super::get_fallback_borrow_rate("ETH", config_default);
-        assert_eq!(rate, dec!(0.0003), "ETH should use tier 1 rate (0.03% daily)");
+        assert_eq!(
+            rate,
+            dec!(0.0003),
+            "ETH should use tier 1 rate (0.03% daily)"
+        );
     }
 
     #[test]
     fn test_fallback_borrow_rate_tier2_sol() {
         let config_default = dec!(0.001);
         let rate = super::get_fallback_borrow_rate("SOL", config_default);
-        assert_eq!(rate, dec!(0.0007), "SOL should use tier 2 rate (0.07% daily)");
+        assert_eq!(
+            rate,
+            dec!(0.0007),
+            "SOL should use tier 2 rate (0.07% daily)"
+        );
     }
 
     #[test]
     fn test_fallback_borrow_rate_tier2_bnb() {
         let config_default = dec!(0.001);
         let rate = super::get_fallback_borrow_rate("BNB", config_default);
-        assert_eq!(rate, dec!(0.0007), "BNB should use tier 2 rate (0.07% daily)");
+        assert_eq!(
+            rate,
+            dec!(0.0007),
+            "BNB should use tier 2 rate (0.07% daily)"
+        );
     }
 
     #[test]
