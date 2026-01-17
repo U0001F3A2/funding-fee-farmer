@@ -4,7 +4,7 @@ use crate::exchange::Position;
 use crate::risk::margin::{MarginHealth, MarginMonitor};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 /// Action to take for a position at risk of liquidation.
@@ -37,10 +37,16 @@ impl LiquidationGuard {
     }
 
     /// Evaluate positions and determine required actions.
+    ///
+    /// # Arguments
+    /// * `positions` - All current positions
+    /// * `total_margin` - Total margin balance (for cross-margin allocation)
+    /// * `maintenance_rates` - Map of symbol -> maintenance margin rate from API
     pub fn evaluate(
         &self,
         positions: &[Position],
         total_margin: Decimal,
+        maintenance_rates: &HashMap<String, Decimal>,
     ) -> Vec<LiquidationAction> {
         let mut actions = Vec::new();
 
@@ -54,10 +60,19 @@ impl LiquidationGuard {
                 continue;
             }
 
+            // Get maintenance rate for this symbol (fallback to 0.4%)
+            let maint_rate = maintenance_rates
+                .get(&pos.symbol)
+                .copied()
+                .unwrap_or(dec!(0.004));
+
+            // Calculate position-specific margin
+            let position_margin = MarginMonitor::calculate_position_margin(pos, positions, total_margin);
+
             let ratio = self.margin_monitor.calculate_margin_ratio(
-                total_margin,
+                position_margin,
+                maint_rate,
                 pos.notional.abs(),
-                pos.leverage,
             );
 
             let health = self.margin_monitor.get_health(ratio);
