@@ -434,10 +434,40 @@ async fn main() -> Result<()> {
                         // Limit to top 2 for MVP
                         let price = prices.get(&alloc.symbol).copied().unwrap_or(dec!(50000));
 
-                        info!("📈 [EXECUTE] Entering position: {}", alloc.symbol);
+                        // Get current position size for this symbol
+                        let current_position_qty = current_positions
+                            .get(&alloc.symbol)
+                            .copied()
+                            .unwrap_or(Decimal::ZERO) / price;
 
-                        // Calculate quantity
-                        let quantity = (alloc.target_size_usdt / price).round_dp(4);
+                        // Calculate target quantity
+                        let target_qty = (alloc.target_size_usdt / price).round_dp(4);
+
+                        // Calculate delta - only ADD to position, never reduce here
+                        // (Reductions are handled by rebalancer)
+                        let delta_qty = target_qty - current_position_qty.abs();
+
+                        // Skip if position already exists or delta is too small
+                        if current_position_qty.abs() > Decimal::ZERO {
+                            debug!(
+                                "⏩ [SKIP] {} already has position: {:.4} (target: {:.4})",
+                                alloc.symbol, current_position_qty, target_qty
+                            );
+                            continue;
+                        }
+
+                        if delta_qty <= Decimal::ZERO {
+                            debug!(
+                                "⏩ [SKIP] {} delta is zero or negative: {:.4}",
+                                alloc.symbol, delta_qty
+                            );
+                            continue;
+                        }
+
+                        info!("📈 [EXECUTE] Entering NEW position: {} (qty: {:.4})", alloc.symbol, target_qty);
+
+                        // Calculate quantity - only enter new positions, not adjustments
+                        let quantity = target_qty;
 
                         // Determine sides based on funding direction
                         let (futures_side, spot_side) = if alloc.funding_rate > Decimal::ZERO {
