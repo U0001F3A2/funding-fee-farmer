@@ -183,6 +183,7 @@ mod tests {
                 max_errors_per_minute: 10,
                 max_consecutive_failures: 3,
                 emergency_delta_drift: dec!(0.10),
+                max_consecutive_risk_cycles: 3,
             },
             5,
         )

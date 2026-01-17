@@ -47,6 +47,9 @@ pub struct RiskOrchestratorConfig {
     pub max_errors_per_minute: u32,
     pub max_consecutive_failures: u32,
     pub emergency_delta_drift: Decimal,
+
+    // Circuit breaker
+    pub max_consecutive_risk_cycles: u32,
 }
 
 impl Default for RiskOrchestratorConfig {
@@ -62,6 +65,7 @@ impl Default for RiskOrchestratorConfig {
             max_errors_per_minute: 10,
             max_consecutive_failures: 3,
             emergency_delta_drift: dec!(0.10),
+            max_consecutive_risk_cycles: 3,
         }
     }
 }
@@ -203,6 +207,7 @@ pub struct RiskOrchestrator {
     position_tracker: PositionTracker,
     funding_verifier: FundingVerifier,
     malfunction_detector: MalfunctionDetector,
+    consecutive_risk_cycles: u32,
 }
 
 impl RiskOrchestrator {
@@ -234,6 +239,7 @@ impl RiskOrchestrator {
             max_errors_per_minute: config.max_errors_per_minute,
             max_consecutive_failures: config.max_consecutive_failures,
             emergency_delta_drift: config.emergency_delta_drift,
+            max_consecutive_risk_cycles: config.max_consecutive_risk_cycles,
         };
 
         let margin_monitor = MarginMonitor::new(risk_config.clone());
@@ -246,6 +252,7 @@ impl RiskOrchestrator {
             position_tracker: PositionTracker::new(position_loss_config),
             funding_verifier: FundingVerifier::new(config.max_funding_deviation),
             malfunction_detector: MalfunctionDetector::new(malfunction_config),
+            consecutive_risk_cycles: 0,
             config,
         }
     }
@@ -420,6 +427,52 @@ impl RiskOrchestrator {
             alert.emit();
         }
 
+        // Circuit breaker: track consecutive cycles with ERROR/CRITICAL alerts
+        let has_critical_alerts = result.alerts.iter().any(|alert| {
+            matches!(alert.severity, AlertSeverity::Error | AlertSeverity::Critical)
+        });
+
+        if has_critical_alerts {
+            self.consecutive_risk_cycles += 1;
+            debug!(
+                "Risk cycle with critical alerts (consecutive: {}/{})",
+                self.consecutive_risk_cycles,
+                self.config.max_consecutive_risk_cycles
+            );
+
+            if self.consecutive_risk_cycles >= self.config.max_consecutive_risk_cycles {
+                result.should_halt = true;
+                error!(
+                    "🚨 [CIRCUIT BREAKER] Trading halted after {} consecutive cycles with ERROR/CRITICAL alerts",
+                    self.consecutive_risk_cycles
+                );
+
+                result.alerts.push(
+                    RiskAlert::new(
+                        RiskAlertType::Malfunction {
+                            malfunction_type: "CircuitBreakerTripped".to_string(),
+                        },
+                        AlertSeverity::Critical,
+                        None,
+                        format!(
+                            "Circuit breaker triggered: {} consecutive risk cycles with critical alerts",
+                            self.consecutive_risk_cycles
+                        ),
+                        "Halt all trading immediately - manual intervention required".to_string(),
+                    )
+                    .with_metric("consecutive_risk_cycles", Decimal::from(self.consecutive_risk_cycles)),
+                );
+            }
+        } else {
+            if self.consecutive_risk_cycles > 0 {
+                debug!(
+                    "Risk cycle completed without critical alerts, resetting counter from {}",
+                    self.consecutive_risk_cycles
+                );
+            }
+            self.consecutive_risk_cycles = 0;
+        }
+
         result
     }
 
@@ -589,4 +642,101 @@ mod tests {
         // Third error should trigger alert
         assert!(orchestrator.record_error("test").is_some());
     }
+
+    #[test]
+    fn test_circuit_breaker_triggers_after_consecutive_risk_cycles() {
+        let config = RiskOrchestratorConfig {
+            max_consecutive_risk_cycles: 3,
+            min_margin_ratio: dec!(3.0),
+            max_drawdown: dec!(0.05),
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        // Create a position that triggers ERROR level alerts (ORANGE margin health)
+        // but not CRITICAL (RED margin health which would halt immediately).
+        // We want margin ratio between 1.5x and 2.0x to get ORANGE health (ERROR alert).
+        // With margin_balance of 400 and notional of 50000 at 5x leverage:
+        // margin ratio = 400 / (50000 * 0.004) = 400 / 200 = 2.0 (ORANGE - ERROR level)
+        let position = crate::exchange::Position {
+            symbol: "BTCUSDT".to_string(),
+            position_amt: dec!(1.0),
+            entry_price: dec!(50000),
+            unrealized_profit: dec!(-100), // Small unrealized loss
+            leverage: 5,
+            notional: dec!(50000),
+            isolated_margin: dec!(0),
+            mark_price: dec!(50000),
+            liquidation_price: dec!(0),
+            position_side: crate::exchange::PositionSide::Both,
+            margin_type: crate::exchange::MarginType::Cross,
+        };
+
+        // Use margin balance that gives ~2x margin ratio (ORANGE health = ERROR severity)
+        let margin_balance = dec!(400);
+        let equity = dec!(9900);
+
+        // First cycle with ERROR alert - should not halt
+        let result1 = orchestrator.check_all(&[position.clone()], equity, margin_balance);
+        assert!(!result1.should_halt);
+        assert!(!result1.alerts.is_empty());
+
+        // Second cycle with ERROR alert - should not halt
+        let result2 = orchestrator.check_all(&[position.clone()], equity, margin_balance);
+        assert!(!result2.should_halt);
+
+        // Third cycle with ERROR alert - SHOULD HALT (circuit breaker triggered)
+        let result3 = orchestrator.check_all(&[position.clone()], equity, margin_balance);
+        assert!(result3.should_halt);
+
+        // Verify circuit breaker alert was added
+        let has_circuit_breaker_alert = result3.alerts.iter().any(|alert| {
+            matches!(&alert.alert_type, RiskAlertType::Malfunction { malfunction_type }
+                if malfunction_type == "CircuitBreakerTripped")
+        });
+        assert!(has_circuit_breaker_alert);
+    }
+
+    #[test]
+    fn test_circuit_breaker_resets_when_no_critical_alerts() {
+        let config = RiskOrchestratorConfig {
+            max_consecutive_risk_cycles: 3,
+            min_margin_ratio: dec!(3.0),
+            max_drawdown: dec!(0.05),
+            ..Default::default()
+        };
+        let mut orchestrator = RiskOrchestrator::new(config, dec!(10000));
+
+        let error_position = crate::exchange::Position {
+            symbol: "BTCUSDT".to_string(),
+            position_amt: dec!(1.0),
+            entry_price: dec!(50000),
+            unrealized_profit: dec!(-100),
+            leverage: 5,
+            notional: dec!(50000),
+            isolated_margin: dec!(0),
+            mark_price: dec!(50000),
+            liquidation_price: dec!(0),
+            position_side: crate::exchange::PositionSide::Both,
+            margin_type: crate::exchange::MarginType::Cross,
+        };
+
+        let margin_balance = dec!(400);
+        let equity = dec!(9900);
+
+        // Two cycles with ERROR alerts
+        orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
+        orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
+
+        // One cycle with no positions (no critical alerts) - should reset counter
+        let result_clean = orchestrator.check_all(&[], dec!(10000), dec!(10000));
+        assert!(!result_clean.should_halt);
+
+        // Now even after 2 more cycles with alerts, should not halt (counter was reset)
+        orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
+        let result = orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
+        assert!(!result.should_halt);
+    }
 }
+
+
