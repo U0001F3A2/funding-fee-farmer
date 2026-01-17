@@ -400,11 +400,11 @@ async fn main() -> Result<()> {
 
             let mock_state = mock_client.get_state().await;
 
-            // Debug: log current positions for troubleshooting
-            debug!(
-                "📊 [DEBUG] current_positions ({} entries): {:?}",
+            // DEBUG: Log current positions with values (elevated to INFO for visibility)
+            info!(
+                "📊 [POSITIONS] current_positions ({} entries): {:?}",
                 current_positions.len(),
-                current_positions.keys().collect::<Vec<_>>()
+                current_positions.iter().map(|(k, v)| format!("{}=${:.2}", k, v)).collect::<Vec<_>>()
             );
 
             let allocations = allocator.calculate_allocation(
@@ -455,25 +455,26 @@ async fn main() -> Result<()> {
                         // (Reductions are handled by rebalancer)
                         let delta_qty = target_qty - current_position_qty.abs();
 
-                        // Debug: log what we're looking up
-                        debug!(
-                            "🔍 [LOOKUP] {} - current_positions has key: {}, value: {:?}",
+                        // DEBUG: Log what we're looking up (elevated to INFO)
+                        info!(
+                            "🔍 [LOOKUP] {} - has_key: {}, usdt_value: {:?}, qty: {:.4}",
                             alloc.symbol,
                             current_positions.contains_key(&alloc.symbol),
-                            current_positions.get(&alloc.symbol)
+                            current_positions.get(&alloc.symbol),
+                            current_position_qty
                         );
 
                         // Skip if position already exists or delta is too small
                         if current_position_qty.abs() > Decimal::ZERO {
-                            debug!(
-                                "⏩ [SKIP] {} already has position: {:.4} (target: {:.4})",
+                            info!(
+                                "⏩ [SKIP] {} already has position: {:.4} qty (target: {:.4})",
                                 alloc.symbol, current_position_qty, target_qty
                             );
                             continue;
                         }
 
                         if delta_qty <= Decimal::ZERO {
-                            debug!(
+                            info!(
                                 "⏩ [SKIP] {} delta is zero or negative: {:.4}",
                                 alloc.symbol, delta_qty
                             );
