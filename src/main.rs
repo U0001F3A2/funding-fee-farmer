@@ -12,7 +12,7 @@ use funding_fee_farmer::config::Config;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
 use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
-    PositionEntry, RiskAlertType, RiskOrchestrator, RiskOrchestratorConfig,
+    MarginMonitor, PositionEntry, RiskAlertType, RiskOrchestrator, RiskOrchestratorConfig,
 };
 use funding_fee_farmer::strategy::{
     CapitalAllocator, HedgeRebalancer, MarketScanner, OrderExecutor, RebalanceConfig,
@@ -793,7 +793,9 @@ async fn main() -> Result<()> {
                 .collect();
 
             // Run comprehensive risk check
-            let risk_result = risk_orchestrator.check_all(&exchange_positions, total_equity, state.balance);
+            // Mock mode: use default maintenance rate since we don't have real leverage brackets
+            let maintenance_rates: HashMap<String, Decimal> = HashMap::new();
+            let risk_result = risk_orchestrator.check_all(&exchange_positions, total_equity, state.balance, &maintenance_rates);
 
             // Check for drawdown warnings
             let drawdown_stats = risk_orchestrator.get_drawdown_stats();
@@ -1046,7 +1048,13 @@ async fn main() -> Result<()> {
                     Err(_) => vec![],
                 };
 
-                let risk_result = risk_orchestrator.check_all(&live_positions, total_equity, margin_balance);
+                // Build maintenance rate map from leverage brackets
+                let maintenance_rates = match real_client.get_leverage_brackets().await {
+                    Ok(brackets) => MarginMonitor::build_maintenance_rate_map(&brackets, &live_positions),
+                    Err(_) => HashMap::new(), // Fallback to default rates
+                };
+
+                let risk_result = risk_orchestrator.check_all(&live_positions, total_equity, margin_balance, &maintenance_rates);
 
                 if risk_result.should_halt {
                     error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");

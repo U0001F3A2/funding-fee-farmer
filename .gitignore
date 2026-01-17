@@ -39,3 +39,6 @@ data/
 
 # Serena MCP config
 .serena/
+
+# EC2 host (local reference)
+.ec2_host

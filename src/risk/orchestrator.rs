@@ -682,18 +682,19 @@ mod tests {
         // Use margin balance that gives ~2x margin ratio (ORANGE health = ERROR severity)
         let margin_balance = dec!(400);
         let equity = dec!(9900);
+        let maintenance_rates = std::collections::HashMap::new();
 
         // First cycle with ERROR alert - should not halt
-        let result1 = orchestrator.check_all(&[position.clone()], equity, margin_balance);
+        let result1 = orchestrator.check_all(&[position.clone()], equity, margin_balance, &maintenance_rates);
         assert!(!result1.should_halt);
         assert!(!result1.alerts.is_empty());
 
         // Second cycle with ERROR alert - should not halt
-        let result2 = orchestrator.check_all(&[position.clone()], equity, margin_balance);
+        let result2 = orchestrator.check_all(&[position.clone()], equity, margin_balance, &maintenance_rates);
         assert!(!result2.should_halt);
 
         // Third cycle with ERROR alert - SHOULD HALT (circuit breaker triggered)
-        let result3 = orchestrator.check_all(&[position.clone()], equity, margin_balance);
+        let result3 = orchestrator.check_all(&[position.clone()], equity, margin_balance, &maintenance_rates);
         assert!(result3.should_halt);
 
         // Verify circuit breaker alert was added
@@ -730,18 +731,19 @@ mod tests {
 
         let margin_balance = dec!(400);
         let equity = dec!(9900);
+        let maintenance_rates = std::collections::HashMap::new();
 
         // Two cycles with ERROR alerts
-        orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
-        orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
+        orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
+        orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
 
         // One cycle with no positions (no critical alerts) - should reset counter
-        let result_clean = orchestrator.check_all(&[], dec!(10000), dec!(10000));
+        let result_clean = orchestrator.check_all(&[], dec!(10000), dec!(10000), &maintenance_rates);
         assert!(!result_clean.should_halt);
 
         // Now even after 2 more cycles with alerts, should not halt (counter was reset)
-        orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
-        let result = orchestrator.check_all(&[error_position.clone()], equity, margin_balance);
+        orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
+        let result = orchestrator.check_all(&[error_position.clone()], equity, margin_balance, &maintenance_rates);
         assert!(!result.should_halt);
     }
 }
