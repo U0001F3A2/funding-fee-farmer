@@ -50,9 +50,14 @@ jobs:
             target/release/funding-fee-farmer \
             "$EC2_USER@$EC2_HOST:/tmp/funding-fee-farmer"
 
+          # Copy to both locations for compatibility
           ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
             "$EC2_USER@$EC2_HOST" \
-            "sudo mv /tmp/funding-fee-farmer /usr/local/bin/funding-fee-farmer && sudo chmod +x /usr/local/bin/funding-fee-farmer"
+            "sudo cp /tmp/funding-fee-farmer /usr/local/bin/funding-fee-farmer && \
+             sudo chmod +x /usr/local/bin/funding-fee-farmer && \
+             cp /tmp/funding-fee-farmer /home/ec2-user/funding-fee-farmer/funding-fee-farmer && \
+             chmod +x /home/ec2-user/funding-fee-farmer/funding-fee-farmer && \
+             rm /tmp/funding-fee-farmer"
 
       - name: Start service on EC2
         env:
