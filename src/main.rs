@@ -245,21 +245,25 @@ async fn main() -> Result<()> {
         .expect("Failed to initialize persistence database");
 
     // Try to restore previous state
-    let initial_balance = if let Ok(Some(persisted_state)) = persistence.load_state() {
-        info!("📂 [PERSISTENCE] Restoring state from database");
-        info!(
-            "   Balance: ${:.2}, Positions: {}, Total Funding: ${:.4}",
-            persisted_state.balance,
-            persisted_state.positions.len(),
-            persisted_state.total_funding_received
-        );
-        let balance = persisted_state.balance;
-        mock_client.restore_state(persisted_state).await;
-        balance
-    } else {
-        info!("📂 [PERSISTENCE] No previous state found, starting fresh with $10,000");
-        dec!(10000)
-    };
+    // Clone positions before restore_state consumes the persisted_state
+    // These will be registered with the risk orchestrator's position tracker
+    let (initial_balance, restored_positions) =
+        if let Ok(Some(persisted_state)) = persistence.load_state() {
+            info!("📂 [PERSISTENCE] Restoring state from database");
+            info!(
+                "   Balance: ${:.2}, Positions: {}, Total Funding: ${:.4}",
+                persisted_state.balance,
+                persisted_state.positions.len(),
+                persisted_state.total_funding_received
+            );
+            let balance = persisted_state.balance;
+            let positions = persisted_state.positions.clone();
+            mock_client.restore_state(persisted_state).await;
+            (balance, positions)
+        } else {
+            info!("📂 [PERSISTENCE] No previous state found, starting fresh with $10,000");
+            (dec!(10000), HashMap::new())
+        };
 
     // Initialize RiskOrchestrator with comprehensive risk monitoring
     let risk_config = RiskOrchestratorConfig {
@@ -280,6 +284,44 @@ async fn main() -> Result<()> {
         max_consecutive_risk_cycles: config.risk.max_consecutive_risk_cycles,
     };
     let mut risk_orchestrator = RiskOrchestrator::new(risk_config, initial_balance);
+
+    // Register restored positions with risk orchestrator's position tracker
+    // This is CRITICAL for auto-close logic to evaluate existing positions
+    if !restored_positions.is_empty() {
+        info!(
+            "📂 [PERSISTENCE] Registering {} restored positions with risk tracker",
+            restored_positions.len()
+        );
+        for (symbol, pos) in &restored_positions {
+            // Calculate position value from futures side (main position)
+            let position_value = pos.futures_qty.abs() * pos.futures_entry_price;
+
+            // Create entry for position tracker
+            // Note: expected_funding_rate is unknown for restored positions,
+            // but the tracker uses this primarily for expected funding calculations.
+            // We set it to 0 since actual funding is already tracked in total_funding_received.
+            let entry = PositionEntry {
+                symbol: symbol.clone(),
+                entry_price: pos.futures_entry_price,
+                quantity: pos.futures_qty.abs(),
+                position_value,
+                expected_funding_rate: Decimal::ZERO, // Unknown for restored positions
+                entry_fees: position_value * dec!(0.0004), // Estimate ~0.04% taker fee
+            };
+
+            risk_orchestrator.open_position(entry);
+
+            // Restore the funding and interest data to the tracked position
+            // This is critical for accurate profitability calculations
+            risk_orchestrator.record_funding(symbol, pos.total_funding_received);
+            risk_orchestrator.record_interest(symbol, pos.total_interest_paid);
+
+            info!(
+                "   Registered: {} | Value: ${:.2} | Funding: ${:.4} | Interest: ${:.4}",
+                symbol, position_value, pos.total_funding_received, pos.total_interest_paid
+            );
+        }
+    }
 
     // Initialize precisions
     match real_client.get_futures_exchange_info().await {
