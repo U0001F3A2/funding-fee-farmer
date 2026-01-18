@@ -258,7 +258,16 @@ impl MockBinanceClient {
         let mut state = self.state.write().await;
         let prices = self.prices.read().await;
 
-        let price = prices.get(&order.symbol).copied().unwrap_or(dec!(50000));
+        // IMPORTANT: Use entry price as fallback to avoid catastrophic fee errors
+        // The old default of $50,000 would cause massive incorrect fees for low-priced assets
+        let fallback_price = state
+            .positions
+            .get(&order.symbol)
+            .map(|p| p.futures_entry_price)
+            .filter(|p| *p > Decimal::ZERO)
+            .unwrap_or(dec!(1)); // Last resort: $1 (much safer than $50,000)
+
+        let price = prices.get(&order.symbol).copied().unwrap_or(fallback_price);
         let quantity = order.quantity.unwrap_or(Decimal::ZERO);
         let notional = quantity * price;
         let fee = notional * self.fee_rate;
@@ -320,7 +329,16 @@ impl MockBinanceClient {
         let mut state = self.state.write().await;
         let prices = self.prices.read().await;
 
-        let price = prices.get(&order.symbol).copied().unwrap_or(dec!(50000));
+        // IMPORTANT: Use entry price as fallback to avoid catastrophic fee errors
+        // The old default of $50,000 would cause massive incorrect fees for low-priced assets
+        let fallback_price = state
+            .positions
+            .get(&order.symbol)
+            .map(|p| p.spot_entry_price)
+            .filter(|p| *p > Decimal::ZERO)
+            .unwrap_or(dec!(1)); // Last resort: $1 (much safer than $50,000)
+
+        let price = prices.get(&order.symbol).copied().unwrap_or(fallback_price);
         let quantity = order.quantity.unwrap_or(Decimal::ZERO);
         let notional = quantity * price;
         let fee = notional * self.fee_rate;
@@ -400,14 +418,12 @@ impl MockBinanceClient {
     /// Get delta-neutral positions from mock state.
     pub async fn get_delta_neutral_positions(&self) -> Vec<DeltaNeutralPosition> {
         let state = self.state.read().await;
-        let prices = self.prices.read().await;
 
         state
             .positions
             .iter()
             .filter(|(_, p)| p.futures_qty != Decimal::ZERO || p.spot_qty != Decimal::ZERO)
             .map(|(symbol, p)| {
-                let _price = prices.get(symbol).copied().unwrap_or(dec!(50000));
                 DeltaNeutralPosition {
                     symbol: symbol.clone(),
                     spot_symbol: symbol.clone(),

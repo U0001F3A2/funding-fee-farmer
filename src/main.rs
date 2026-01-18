@@ -487,7 +487,16 @@ async fn main() -> Result<()> {
 
                     for alloc in allocations.iter().take(2) {
                         // Limit to top 2 for MVP
-                        let price = prices.get(&alloc.symbol).copied().unwrap_or(dec!(50000));
+                        let price = match prices.get(&alloc.symbol).copied() {
+                            Some(p) if p > Decimal::ZERO => p,
+                            _ => {
+                                warn!(
+                                    "⚠️  [SKIP] No valid price for {} - skipping allocation",
+                                    alloc.symbol
+                                );
+                                continue;
+                            }
+                        };
 
                         // Get current position size for this symbol
                         let current_position_qty = current_positions
@@ -783,10 +792,16 @@ async fn main() -> Result<()> {
                     let prices = fetch_prices(&real_client, &qualified_pairs).await;
 
                     for reduction in &reductions {
-                        let price = prices
-                            .get(&reduction.symbol)
-                            .copied()
-                            .unwrap_or(dec!(50000));
+                        let price = match prices.get(&reduction.symbol).copied() {
+                            Some(p) if p > Decimal::ZERO => p,
+                            _ => {
+                                warn!(
+                                    "⚠️  [SKIP] No valid price for {} - skipping reduction",
+                                    reduction.symbol
+                                );
+                                continue;
+                            }
+                        };
                         let reduction_qty = (reduction.reduction_usdt / price).round_dp(4);
 
                         if reduction_qty <= Decimal::ZERO {
@@ -957,7 +972,13 @@ async fn main() -> Result<()> {
                         .get(&position.symbol)
                         .copied()
                         .unwrap_or(Decimal::ZERO);
-                    let price = prices.get(&position.symbol).copied().unwrap_or(dec!(50000));
+                    let price = match prices.get(&position.symbol).copied() {
+                        Some(p) if p > Decimal::ZERO => p,
+                        _ => {
+                            // Use position entry price as fallback for rebalancing analysis
+                            position.futures_entry_price
+                        }
+                    };
 
                     let action = rebalancer.analyze_position(position, funding_rate, price);
 
@@ -1565,6 +1586,40 @@ async fn main() -> Result<()> {
             }
 
             // Handle positions to close
+            // CRITICAL: Update mock client prices BEFORE closing positions
+            // Without this, the mock client uses default $50,000 which causes massive fee errors
+            if !risk_result.positions_to_close.is_empty() {
+                // Fetch current prices for positions to close
+                let close_symbols: Vec<String> = risk_result
+                    .positions_to_close
+                    .iter()
+                    .cloned()
+                    .collect();
+
+                // Get book tickers for accurate prices
+                if let Ok(tickers) = real_client.get_book_tickers().await {
+                    let mut close_prices: HashMap<String, Decimal> = HashMap::new();
+                    for ticker in tickers {
+                        if close_symbols.contains(&ticker.symbol) {
+                            close_prices.insert(ticker.symbol.clone(), ticker.bid_price);
+                        }
+                    }
+
+                    // Update mock client prices
+                    if !close_prices.is_empty() {
+                        // Get existing funding rates (we don't want to clear them)
+                        let existing_rates = HashMap::new(); // Empty - rates aren't needed for closing
+                        mock_client
+                            .update_market_data(existing_rates, close_prices)
+                            .await;
+                        debug!(
+                            "Updated mock client prices for {} positions to close",
+                            risk_result.positions_to_close.len()
+                        );
+                    }
+                }
+            }
+
             for symbol in &risk_result.positions_to_close {
                 warn!(
                     "🚨 [RISK] Position {} flagged for closure by risk orchestrator",
