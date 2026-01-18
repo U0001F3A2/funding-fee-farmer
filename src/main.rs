@@ -307,6 +307,7 @@ async fn main() -> Result<()> {
                 position_value,
                 expected_funding_rate: Decimal::ZERO, // Unknown for restored positions
                 entry_fees: position_value * dec!(0.0004), // Estimate ~0.04% taker fee
+                opened_at: Some(pos.opened_at), // Use original opened_at for proper grace period
             };
 
             risk_orchestrator.open_position(entry);
@@ -669,6 +670,7 @@ async fn main() -> Result<()> {
                             position_value: alloc.target_size_usdt,
                             expected_funding_rate: alloc.funding_rate,
                             entry_fees: alloc.target_size_usdt * dec!(0.0004), // ~0.04% taker fee
+                            opened_at: None, // New position - use current time
                         };
                         risk_orchestrator.open_position(entry);
                     }

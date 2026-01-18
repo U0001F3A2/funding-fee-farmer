@@ -52,6 +52,9 @@ pub struct PositionEntry {
     pub expected_funding_rate: Decimal,
     pub entry_fees: Decimal,
     pub position_value: Decimal,
+    /// Optional: When the position was originally opened (for restored positions).
+    /// If None, uses current time (for new positions).
+    pub opened_at: Option<DateTime<Utc>>,
 }
 
 /// Tracks a position's lifecycle and profitability.
@@ -89,7 +92,7 @@ impl TrackedPosition {
     pub fn new(symbol: String, entry: PositionEntry) -> Self {
         Self {
             symbol,
-            opened_at: Utc::now(),
+            opened_at: entry.opened_at.unwrap_or_else(Utc::now),
             entry_price: entry.entry_price,
             quantity: entry.quantity,
             position_value: entry.position_value,
@@ -610,6 +613,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
 
         tracker.open_position("BTCUSDT", entry);
@@ -629,6 +633,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
 
         tracker.open_position("BTCUSDT", entry);
@@ -650,6 +655,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
 
         tracker.open_position("BTCUSDT", entry);
@@ -674,6 +680,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
 
         tracker.open_position("BTCUSDT", entry);

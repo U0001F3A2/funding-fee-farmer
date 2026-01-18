@@ -657,6 +657,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
 
         orchestrator.open_position(entry);
@@ -1191,6 +1192,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
         orchestrator.open_position(entry);
 
@@ -1263,6 +1265,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
         orchestrator.open_position(entry);
 
@@ -1291,6 +1294,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         };
         orchestrator.open_position(entry);
 
@@ -1319,6 +1323,7 @@ mod tests {
             expected_funding_rate: dec!(0.0001),
             entry_fees: dec!(2),
             position_value: dec!(5000),
+            opened_at: None,
         });
 
         orchestrator.open_position(PositionEntry {
@@ -1328,6 +1333,7 @@ mod tests {
             expected_funding_rate: dec!(0.00015),
             entry_fees: dec!(1),
             position_value: dec!(3000),
+            opened_at: None,
         });
 
         let positions = orchestrator.get_all_tracked_positions();
