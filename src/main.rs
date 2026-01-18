@@ -1065,14 +1065,89 @@ async fn main() -> Result<()> {
                             }
                             funding_fee_farmer::strategy::RebalanceAction::ClosePosition {
                                 symbol,
-                                spot_symbol: _,
+                                spot_symbol,
                                 futures_qty,
                                 spot_qty,
                             } => {
                                 warn!(
-                                    "⚠️  [REBALANCE] Position close executed for {} (futures: {}, spot: {})",
+                                    "⚠️  [REBALANCE] Executing position close for {} (futures: {}, spot: {})",
                                     symbol, futures_qty, spot_qty
                                 );
+
+                                let mut close_success = true;
+
+                                // Close futures leg first
+                                if *futures_qty != Decimal::ZERO {
+                                    let futures_side = if *futures_qty > Decimal::ZERO {
+                                        funding_fee_farmer::exchange::OrderSide::Sell
+                                    } else {
+                                        funding_fee_farmer::exchange::OrderSide::Buy
+                                    };
+
+                                    let futures_order = funding_fee_farmer::exchange::NewOrder {
+                                        symbol: symbol.clone(),
+                                        side: futures_side,
+                                        position_side: None,
+                                        order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                        quantity: Some(futures_qty.abs()),
+                                        price: None,
+                                        time_in_force: None,
+                                        reduce_only: Some(true),
+                                        new_client_order_id: None,
+                                    };
+
+                                    match mock_client.place_futures_order(&futures_order).await {
+                                        Ok(_) => {
+                                            info!("✅ [CLOSE] Futures closed for {}", symbol);
+                                        }
+                                        Err(e) => {
+                                            error!("❌ [CLOSE] Futures close failed for {}: {}", symbol, e);
+                                            close_success = false;
+                                            metrics.errors_count += 1;
+                                        }
+                                    }
+                                }
+
+                                // Close spot leg
+                                if *spot_qty != Decimal::ZERO {
+                                    let spot_side = if *spot_qty > Decimal::ZERO {
+                                        funding_fee_farmer::exchange::OrderSide::Sell
+                                    } else {
+                                        funding_fee_farmer::exchange::OrderSide::Buy
+                                    };
+
+                                    let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                                        symbol: spot_symbol.clone(),
+                                        side: spot_side,
+                                        order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                        quantity: Some(spot_qty.abs()),
+                                        price: None,
+                                        time_in_force: None,
+                                        is_isolated: Some(false),
+                                        side_effect_type: Some(
+                                            funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                                        ),
+                                    };
+
+                                    match mock_client.place_margin_order(&spot_order).await {
+                                        Ok(_) => {
+                                            info!("✅ [CLOSE] Spot closed for {}", symbol);
+                                        }
+                                        Err(e) => {
+                                            error!("❌ [CLOSE] Spot close failed for {}: {}", symbol, e);
+                                            close_success = false;
+                                            metrics.errors_count += 1;
+                                        }
+                                    }
+                                }
+
+                                if close_success {
+                                    info!("✅ [CLOSE] Position {} fully closed via rebalance", symbol);
+                                    // Remove from position tracker
+                                    risk_orchestrator.close_position(symbol);
+                                } else {
+                                    error!("❌ [CLOSE] Position {} close incomplete - manual intervention may be needed", symbol);
+                                }
                             }
                             funding_fee_farmer::strategy::RebalanceAction::None => {}
                         }

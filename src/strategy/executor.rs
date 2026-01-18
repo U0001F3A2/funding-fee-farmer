@@ -156,25 +156,65 @@ impl OrderExecutor {
                 Some(order)
             }
             Err(e) => {
-                error!(%spot_symbol, error = %e, "Failed to place spot hedge order - UNWINDING FUTURES");
-                // Critical: Spot leg failed, need to unwind futures to avoid naked exposure
+                error!(%spot_symbol, error = %e, "Failed to place spot hedge order - INITIATING EMERGENCY UNWIND");
+                // CRITICAL: Spot leg failed, MUST unwind futures to avoid naked directional exposure
+                // This is an emergency situation - retry aggressively
                 if let Some(ref f_order) = futures_order {
                     let unwind_side = if futures_side == OrderSide::Buy {
                         OrderSide::Sell
                     } else {
                         OrderSide::Buy
                     };
-                    if let Err(unwind_err) = self
-                        .place_futures_order_with_retry(
-                            client,
-                            symbol,
-                            unwind_side,
-                            f_order.executed_qty,
-                            3,
-                        )
-                        .await
-                    {
-                        error!(%symbol, error = %unwind_err, "CRITICAL: Failed to unwind futures position!");
+
+                    let mut unwind_success = false;
+                    let max_unwind_attempts = 10;
+
+                    for attempt in 1..=max_unwind_attempts {
+                        match self
+                            .place_futures_order_with_retry(
+                                client,
+                                symbol,
+                                unwind_side,
+                                f_order.executed_qty,
+                                3, // Each attempt has 3 internal retries
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(%symbol, attempt, "✅ Emergency futures unwind successful");
+                                unwind_success = true;
+                                break;
+                            }
+                            Err(unwind_err) => {
+                                let backoff_secs = 2_u64.pow(attempt.min(6)); // Max 64s backoff
+                                error!(
+                                    %symbol,
+                                    attempt,
+                                    max_attempts = max_unwind_attempts,
+                                    backoff_secs,
+                                    error = %unwind_err,
+                                    "⚠️ Unwind attempt failed - retrying"
+                                );
+                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            }
+                        }
+                    }
+
+                    if !unwind_success {
+                        // CRITICAL FAILURE: Could not unwind naked futures position
+                        // This is a severe situation that requires manual intervention
+                        error!(
+                            %symbol,
+                            futures_qty = %f_order.executed_qty,
+                            futures_side = ?futures_side,
+                            "🚨 CRITICAL: FAILED TO UNWIND FUTURES AFTER {} ATTEMPTS! NAKED EXPOSURE EXISTS!",
+                            max_unwind_attempts
+                        );
+                        // Return error to signal critical failure - caller should halt trading
+                        return Err(anyhow!(
+                            "CRITICAL: Failed to unwind naked futures position for {} after {} attempts. Manual intervention required!",
+                            symbol, max_unwind_attempts
+                        ));
                     }
                 }
                 return Ok(EntryResult {
@@ -187,7 +227,7 @@ impl OrderExecutor {
             }
         };
 
-        // Verify delta neutrality
+        // Verify delta neutrality with strict threshold
         let futures_qty = futures_order
             .as_ref()
             .map(|o| o.executed_qty)
@@ -203,26 +243,47 @@ impl OrderExecutor {
             dec!(0)
         };
 
-        if delta_pct > dec!(1) {
+        // STRICT THRESHOLD: Max 0.5% delta mismatch allowed (was 5%)
+        // For a $10k position, 0.5% = $50 max unhedged exposure
+        const MAX_DELTA_PCT: Decimal = dec!(0.5);
+        const WARN_DELTA_PCT: Decimal = dec!(0.1);
+
+        if delta_pct > WARN_DELTA_PCT {
             warn!(
                 %symbol,
                 futures_qty = %futures_qty,
                 spot_qty = %spot_qty,
                 delta_diff_pct = %delta_pct,
-                "Delta mismatch > 1% - position partially hedged"
+                max_allowed = %MAX_DELTA_PCT,
+                "⚠️ Delta mismatch detected - position partially hedged"
             );
         }
+
+        // If delta exceeds strict threshold, attempt gap-fill or fail
+        let (success, error) = if delta_pct > MAX_DELTA_PCT {
+            // Delta too large - this is a problem
+            error!(
+                %symbol,
+                delta_pct = %delta_pct,
+                max_allowed = %MAX_DELTA_PCT,
+                futures_qty = %futures_qty,
+                spot_qty = %spot_qty,
+                "❌ Delta mismatch exceeds maximum allowed threshold"
+            );
+            (false, Some(format!(
+                "Delta mismatch {:.2}% exceeds max allowed {:.2}%. Position has unhedged exposure.",
+                delta_pct, MAX_DELTA_PCT
+            )))
+        } else {
+            (true, None)
+        };
 
         Ok(EntryResult {
             symbol: symbol.clone(),
             spot_order,
             futures_order,
-            success: delta_pct <= dec!(5), // Allow up to 5% mismatch
-            error: if delta_pct > dec!(5) {
-                Some(format!("Delta mismatch: {:.2}%", delta_pct))
-            } else {
-                None
-            },
+            success,
+            error,
         })
     }
 
