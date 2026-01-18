@@ -272,6 +272,8 @@ async fn main() -> Result<()> {
         min_expected_yield: config.risk.min_expected_yield,
         grace_period_hours: config.risk.grace_period_hours,
         max_funding_deviation: config.risk.max_funding_deviation,
+        max_loss_usd: config.risk.max_loss_usd,
+        max_negative_apy: config.risk.max_negative_apy,
         max_errors_per_minute: config.risk.max_errors_per_minute,
         max_consecutive_failures: config.risk.max_consecutive_failures,
         emergency_delta_drift: config.risk.emergency_delta_drift,
@@ -903,6 +905,9 @@ async fn main() -> Result<()> {
                     .collect();
                 let prices = fetch_prices(&real_client, &qualified_pairs).await;
 
+                // Collect positions that need to be closed due to funding direction flip
+                let mut flip_positions_to_close: Vec<String> = Vec::new();
+
                 for position in &positions {
                     let funding_rate = funding_rates
                         .get(&position.symbol)
@@ -987,11 +992,11 @@ async fn main() -> Result<()> {
                                 new_funding_direction,
                             } => {
                                 warn!(
-                                    "⚠️  [REBALANCE] Position flip for {} to {:?} requires manual review",
+                                    "🔄 [FLIP] Funding direction reversed for {} to {:?} - scheduling close",
                                     symbol, new_funding_direction
                                 );
-                                // Flipping is complex - log for now, would need to close both legs
-                                // and re-enter with opposite direction
+                                // Mark for closure - scanner will re-enter with correct direction
+                                flip_positions_to_close.push(symbol.clone());
                             }
                             funding_fee_farmer::strategy::RebalanceAction::ClosePosition {
                                 symbol,
@@ -1005,6 +1010,76 @@ async fn main() -> Result<()> {
                                 );
                             }
                             funding_fee_farmer::strategy::RebalanceAction::None => {}
+                        }
+                    }
+                }
+
+                // Close positions that need to flip direction
+                for symbol in &flip_positions_to_close {
+                    warn!("🔄 [FLIP] Closing position {} for direction reversal", symbol);
+
+                    if let Some(pos) = positions.iter().find(|p| p.symbol == *symbol) {
+                        let mut close_success = true;
+
+                        // Close futures leg
+                        if pos.futures_qty != Decimal::ZERO {
+                            let futures_side = if pos.futures_qty > Decimal::ZERO {
+                                funding_fee_farmer::exchange::OrderSide::Sell
+                            } else {
+                                funding_fee_farmer::exchange::OrderSide::Buy
+                            };
+
+                            let futures_order = funding_fee_farmer::exchange::NewOrder {
+                                symbol: pos.symbol.clone(),
+                                side: futures_side,
+                                position_side: None,
+                                order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                quantity: Some(pos.futures_qty.abs()),
+                                price: None,
+                                time_in_force: None,
+                                reduce_only: Some(true),
+                                new_client_order_id: None,
+                            };
+
+                            if let Err(e) = mock_client.place_futures_order(&futures_order).await {
+                                error!("❌ [FLIP] Futures close failed for {}: {}", symbol, e);
+                                close_success = false;
+                            }
+                        }
+
+                        // Close spot leg
+                        if pos.spot_qty != Decimal::ZERO {
+                            let spot_side = if pos.spot_qty > Decimal::ZERO {
+                                funding_fee_farmer::exchange::OrderSide::Sell
+                            } else {
+                                funding_fee_farmer::exchange::OrderSide::Buy
+                            };
+
+                            let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                                symbol: pos.spot_symbol.clone(),
+                                side: spot_side,
+                                order_type: funding_fee_farmer::exchange::OrderType::Market,
+                                quantity: Some(pos.spot_qty.abs()),
+                                price: None,
+                                time_in_force: None,
+                                is_isolated: Some(false),
+                                side_effect_type: Some(
+                                    funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                                ),
+                            };
+
+                            if let Err(e) = mock_client.place_margin_order(&spot_order).await {
+                                error!("❌ [FLIP] Spot close failed for {}: {}", symbol, e);
+                                close_success = false;
+                            }
+                        }
+
+                        if close_success {
+                            info!("✅ [FLIP] Closed {} - scanner will re-enter with new direction", symbol);
+                            // Remove from tracking
+                            risk_orchestrator.close_position(symbol);
+                        } else {
+                            metrics.errors_count += 1;
                         }
                     }
                 }

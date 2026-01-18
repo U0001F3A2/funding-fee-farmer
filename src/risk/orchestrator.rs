@@ -44,6 +44,8 @@ pub struct RiskOrchestratorConfig {
     pub min_expected_yield: Decimal,
     pub grace_period_hours: u32,
     pub max_funding_deviation: Decimal,
+    pub max_loss_usd: Decimal,
+    pub max_negative_apy: Decimal,
 
     // Malfunction detection
     pub max_errors_per_minute: u32,
@@ -62,10 +64,12 @@ impl Default for RiskOrchestratorConfig {
             max_single_position: dec!(0.30),
             min_holding_period_hours: 24,
             min_yield_advantage: dec!(0.05),
-            max_unprofitable_hours: 48,
+            max_unprofitable_hours: 12,
             min_expected_yield: dec!(0.10),
-            grace_period_hours: 8,
+            grace_period_hours: 4,
             max_funding_deviation: dec!(0.20),
+            max_loss_usd: dec!(10),
+            max_negative_apy: dec!(0.50),
             max_errors_per_minute: 10,
             max_consecutive_failures: 3,
             emergency_delta_drift: dec!(0.10),
@@ -209,6 +213,8 @@ impl RiskOrchestrator {
             min_expected_yield: config.min_expected_yield,
             max_funding_deviation: config.max_funding_deviation,
             grace_period_hours: config.grace_period_hours,
+            max_loss_usd: config.max_loss_usd,
+            max_negative_apy: config.max_negative_apy,
         };
 
         let malfunction_config = MalfunctionConfig {
@@ -229,6 +235,8 @@ impl RiskOrchestrator {
             min_expected_yield: config.min_expected_yield,
             grace_period_hours: config.grace_period_hours,
             max_funding_deviation: config.max_funding_deviation,
+            max_loss_usd: config.max_loss_usd,
+            max_negative_apy: config.max_negative_apy,
             max_errors_per_minute: config.max_errors_per_minute,
             max_consecutive_failures: config.max_consecutive_failures,
             emergency_delta_drift: config.emergency_delta_drift,
@@ -818,9 +826,9 @@ mod tests {
         assert_eq!(config.max_drawdown, dec!(0.05));
         assert_eq!(config.min_margin_ratio, dec!(3.0));
         assert_eq!(config.max_single_position, dec!(0.30));
-        assert_eq!(config.max_unprofitable_hours, 48);
+        assert_eq!(config.max_unprofitable_hours, 12); // Changed from 48 to close positions faster
         assert_eq!(config.min_expected_yield, dec!(0.10));
-        assert_eq!(config.grace_period_hours, 8);
+        assert_eq!(config.grace_period_hours, 4); // Changed from 8 to close positions faster
         assert_eq!(config.max_funding_deviation, dec!(0.20));
         assert_eq!(config.max_errors_per_minute, 10);
         assert_eq!(config.max_consecutive_failures, 3);

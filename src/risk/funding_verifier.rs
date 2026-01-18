@@ -178,7 +178,7 @@ impl FundingVerifier {
     /// Check if a funding payment is anomalous.
     fn check_anomaly(
         &self,
-        symbol: &str,
+        _symbol: &str,
         expected: Decimal,
         actual: Decimal,
         deviation: Decimal,

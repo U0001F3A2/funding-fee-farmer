@@ -9,6 +9,7 @@ use tracing::{info, warn};
 /// A single equity snapshot for tracking.
 #[derive(Debug, Clone)]
 pub struct EquitySnapshot {
+    #[allow(dead_code)] // Timestamp used for equity curve analysis
     pub timestamp: DateTime<Utc>,
     pub equity: Decimal,
 }

@@ -17,6 +17,7 @@ enum RejectReason {
     LowVolume,
     WideSpread,
     LowFunding,
+    LowNetFunding, // Net funding (after borrow costs) too low
     MissingData,
 }
 
@@ -133,6 +134,7 @@ impl MarketScanner {
         let mut rejected_low_volume = 0usize;
         let mut rejected_wide_spread = 0usize;
         let mut rejected_low_funding = 0usize;
+        let mut rejected_low_net_funding = 0usize;
         let mut rejected_missing_data = 0usize;
 
         // Filter and score pairs
@@ -155,6 +157,7 @@ impl MarketScanner {
                             RejectReason::LowVolume => rejected_low_volume += 1,
                             RejectReason::WideSpread => rejected_wide_spread += 1,
                             RejectReason::LowFunding => rejected_low_funding += 1,
+                            RejectReason::LowNetFunding => rejected_low_net_funding += 1,
                             RejectReason::MissingData => rejected_missing_data += 1,
                         }
                         None
@@ -176,6 +179,7 @@ impl MarketScanner {
             rejected_low_volume,
             rejected_wide_spread,
             rejected_low_funding,
+            rejected_low_net_funding,
             rejected_missing_data,
             "Market scan complete"
         );
@@ -280,6 +284,20 @@ impl MarketScanner {
 
         let net_funding = funding_rate_abs - borrow_cost_per_8h;
 
+        // CRITICAL: Reject pairs where net funding (after borrow costs) is too low
+        // This prevents entering positions like STOUSDT where borrow costs exceed funding income
+        if net_funding < self.config.min_net_funding {
+            warn!(
+                symbol,
+                %net_funding,
+                %funding_rate_abs,
+                %borrow_cost_per_8h,
+                min_required = %self.config.min_net_funding,
+                "Rejecting: net funding too low after borrow costs"
+            );
+            return Err(RejectReason::LowNetFunding);
+        }
+
         // Calculate score - prioritize net profitability
         // Score = (Net Funding × 0.5) + (Volume_normalized × 0.25) + (1/Spread × 0.2) + (Margin Safety × 0.05)
         let funding_score = net_funding * dec!(10000); // Scale for comparison
@@ -319,12 +337,13 @@ impl MarketScanner {
         })
     }
 
-    /// Check if a pair qualifies and calculate its score (legacy wrapper).
+    /// Check if a pair qualifies and calculate its score (legacy wrapper for tests).
     /// A pair must have:
     /// 1. USDT perpetual futures available
     /// 2. Spot margin trading enabled for hedging
     /// 3. Base asset borrowable (for shorting spot if needed)
     /// 4. Sufficient volume, tight spread, and meaningful funding rate
+    #[cfg(test)]
     fn qualify_pair(
         &self,
         funding: &FundingRate,
@@ -397,6 +416,7 @@ mod tests {
             min_open_interest: dec!(50_000_000),
             max_positions: 5,
             default_borrow_rate: dec!(0.001), // 0.1% daily fallback
+            min_net_funding: dec!(0.0001),    // 0.01% minimum net funding per 8h
         }
     }
 
@@ -636,6 +656,37 @@ mod tests {
         let pair = result.unwrap();
         assert_eq!(pair.funding_rate, dec!(-0.005));
         assert_eq!(pair.borrow_rate, Some(dec!(0.001)));
+    }
+
+    #[test]
+    fn test_low_net_funding_rejected() {
+        // Create config with high min_net_funding to force rejection
+        let config = PairSelectionConfig {
+            min_volume_24h: dec!(50_000_000),
+            min_funding_rate: dec!(0.0001),
+            max_spread: dec!(0.0002),
+            min_open_interest: dec!(50_000_000),
+            max_positions: 5,
+            default_borrow_rate: dec!(0.01), // 1% daily - very high
+            min_net_funding: dec!(0.005),    // Require 0.5% net funding
+        };
+        let scanner = MarketScanner::new(config);
+        let (volume_map, spread_map, spot_map, margin_map) = setup_test_data();
+
+        // Funding rate 0.001 (0.1%) but borrow cost ~0.33% per 8h
+        // Net funding would be negative, should be rejected
+        let funding = make_funding_rate("BTCUSDT", dec!(-0.001));
+
+        let spot_ref: HashMap<String, &SpotSymbolInfo> =
+            spot_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let margin_ref: HashMap<String, &MarginAsset> =
+            margin_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        let result =
+            scanner.qualify_pair(&funding, &volume_map, &spread_map, &spot_ref, &margin_ref);
+
+        // Should be rejected due to low net funding
+        assert!(result.is_none(), "Expected rejection due to low net funding after borrow costs");
     }
 
     #[test]

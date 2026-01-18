@@ -1,7 +1,7 @@
 //! Binance WebSocket client for real-time market data and user updates.
 
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -128,6 +128,7 @@ pub struct OrderUpdate {
 /// Binance WebSocket client.
 pub struct BinanceWebSocket {
     base_url: String,
+    #[allow(dead_code)] // Stored for potential reconnection logic
     testnet: bool,
 }
 

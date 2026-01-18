@@ -82,6 +82,12 @@ pub struct RiskConfig {
     /// Maximum allowed funding deviation (0.0-1.0)
     #[serde(default = "default_max_funding_deviation")]
     pub max_funding_deviation: Decimal,
+    /// Maximum absolute loss in USD before force exit (e.g., 10.0 = $10)
+    #[serde(default = "default_max_loss_usd")]
+    pub max_loss_usd: Decimal,
+    /// Maximum negative APY before force exit (0.0-1.0, e.g., 0.50 = -50% APY)
+    #[serde(default = "default_max_negative_apy")]
+    pub max_negative_apy: Decimal,
 
     // Malfunction detection
     /// Maximum API errors per minute before alert
@@ -120,6 +126,10 @@ pub struct PairSelectionConfig {
     /// Default daily borrow rate for assets with missing margin data
     #[serde(default = "default_borrow_rate")]
     pub default_borrow_rate: Decimal,
+    /// Minimum net funding rate per 8h (funding - borrow cost) to accept a pair
+    /// Rejects pairs where borrowing costs would eat most/all funding income
+    #[serde(default = "default_min_net_funding")]
+    pub min_net_funding: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +201,10 @@ fn default_borrow_rate() -> Decimal {
     Decimal::new(1, 3) // 0.001 (0.1% daily) - conservative fallback for unknown assets
 }
 
+fn default_min_net_funding() -> Decimal {
+    Decimal::new(1, 4) // 0.0001 (0.01%) minimum net funding per 8h after borrow costs
+}
+
 fn default_leverage() -> u8 {
     5
 }
@@ -218,7 +232,7 @@ fn default_min_yield_advantage() -> Decimal {
 
 // Position loss detection defaults
 fn default_max_unprofitable_hours() -> u32 {
-    48
+    12 // Close positions unprofitable for 12+ hours
 }
 
 fn default_min_expected_yield() -> Decimal {
@@ -226,11 +240,19 @@ fn default_min_expected_yield() -> Decimal {
 }
 
 fn default_grace_period_hours() -> u32 {
-    8
+    4 // 4 hour grace period (half a funding cycle)
 }
 
 fn default_max_funding_deviation() -> Decimal {
     Decimal::new(20, 2) // 0.20 (20%)
+}
+
+fn default_max_loss_usd() -> Decimal {
+    Decimal::new(10, 0) // $10 absolute loss triggers force exit
+}
+
+fn default_max_negative_apy() -> Decimal {
+    Decimal::new(50, 2) // 0.50 (-50% APY triggers force exit)
 }
 
 // Malfunction detection defaults
@@ -313,6 +335,8 @@ impl Default for Config {
                 min_expected_yield: default_min_expected_yield(),
                 grace_period_hours: default_grace_period_hours(),
                 max_funding_deviation: default_max_funding_deviation(),
+                max_loss_usd: default_max_loss_usd(),
+                max_negative_apy: default_max_negative_apy(),
                 max_errors_per_minute: default_max_errors_per_minute(),
                 max_consecutive_failures: default_max_consecutive_failures(),
                 emergency_delta_drift: default_emergency_delta_drift(),
@@ -325,6 +349,7 @@ impl Default for Config {
                 min_open_interest: default_min_open_interest(),
                 max_positions: default_max_positions(),
                 default_borrow_rate: default_borrow_rate(),
+                min_net_funding: default_min_net_funding(),
             },
             execution: ExecutionConfig {
                 default_leverage: default_leverage(),

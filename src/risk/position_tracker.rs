@@ -24,15 +24,21 @@ pub struct PositionLossConfig {
     pub max_funding_deviation: Decimal,
     /// Hours before first profit check (allow positions to settle)
     pub grace_period_hours: u32,
+    /// Maximum absolute loss in USD before force exit
+    pub max_loss_usd: Decimal,
+    /// Maximum negative APY before force exit (e.g., 0.50 = -50% APY)
+    pub max_negative_apy: Decimal,
 }
 
 impl Default for PositionLossConfig {
     fn default() -> Self {
         Self {
-            max_unprofitable_hours: 48,
+            max_unprofitable_hours: 12,
             min_expected_yield: dec!(0.10),
             max_funding_deviation: dec!(0.20),
-            grace_period_hours: 8,
+            grace_period_hours: 4,
+            max_loss_usd: dec!(10),
+            max_negative_apy: dec!(0.50),
         }
     }
 }
@@ -352,6 +358,41 @@ impl PositionTracker {
             pos.hours_unprofitable =
                 (pos.hours_open - self.config.grace_period_hours as f64).max(0.0) as u32;
 
+            // CRITICAL: Force exit if absolute loss exceeds threshold
+            if net_pnl.abs() >= self.config.max_loss_usd {
+                warn!(
+                    %symbol,
+                    net_pnl = %net_pnl,
+                    max_loss = %self.config.max_loss_usd,
+                    "🚨 [AUTO-CLOSE] Position exceeds max loss threshold"
+                );
+                return PositionAction::ForceExit {
+                    reason: format!(
+                        "Absolute loss ${:.2} exceeds max ${:.2}",
+                        net_pnl.abs(),
+                        self.config.max_loss_usd
+                    ),
+                };
+            }
+
+            // CRITICAL: Force exit if APY is deeply negative
+            if annualized < Decimal::ZERO && annualized.abs() >= self.config.max_negative_apy {
+                warn!(
+                    %symbol,
+                    annualized_yield = %annualized,
+                    max_negative = %self.config.max_negative_apy,
+                    "🚨 [AUTO-CLOSE] Position has deeply negative APY"
+                );
+                return PositionAction::ForceExit {
+                    reason: format!(
+                        "APY {:.1}% exceeds -{:.0}% threshold (net PnL: ${:.2})",
+                        annualized * dec!(100),
+                        self.config.max_negative_apy * dec!(100),
+                        net_pnl
+                    ),
+                };
+            }
+
             // Force exit if unprofitable for too long
             if pos.hours_unprofitable >= self.config.max_unprofitable_hours {
                 return PositionAction::ForceExit {
@@ -549,10 +590,12 @@ mod tests {
 
     fn test_config() -> PositionLossConfig {
         PositionLossConfig {
-            max_unprofitable_hours: 48,
+            max_unprofitable_hours: 12,
             min_expected_yield: dec!(0.10),
             max_funding_deviation: dec!(0.20),
-            grace_period_hours: 8,
+            grace_period_hours: 4,
+            max_loss_usd: dec!(10),
+            max_negative_apy: dec!(0.50),
         }
     }
 

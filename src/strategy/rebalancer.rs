@@ -317,20 +317,25 @@ impl HedgeRebalancer {
                 symbol,
                 new_funding_direction,
             } => {
+                // Position flip: close existing position, scanner will reopen with correct direction
+                // Strategy: Return error to signal position should be closed. The caller (main.rs)
+                // will add this to positions_to_close when it sees this error.
                 warn!(
                     %symbol,
                     direction = ?new_funding_direction,
-                    "Position flip not yet implemented - manual intervention required"
+                    "🔄 [FLIP] Funding direction reversed - position should be closed"
                 );
-                // Position flipping is complex: need to close both legs and re-enter opposite
-                // This should be done carefully to minimize execution risk
+
                 Ok(RebalanceResult {
                     symbol: symbol.clone(),
                     action_taken: action.clone(),
                     order: None,
                     new_delta: Decimal::ZERO,
                     success: false,
-                    error: Some("Position flip requires manual intervention".to_string()),
+                    error: Some(format!(
+                        "FLIP_REQUIRED: Funding direction changed to {:?}, close position to allow scanner to re-enter",
+                        new_funding_direction
+                    )),
                 })
             }
 
