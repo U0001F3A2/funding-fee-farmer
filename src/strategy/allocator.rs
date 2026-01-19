@@ -50,6 +50,8 @@ pub struct CapitalAllocator {
     capital_config: CapitalConfig,
     risk_config: RiskConfig,
     default_leverage: u8,
+    /// Precomputed allocation weights based on concentration factor
+    allocation_weights: Vec<Decimal>,
 }
 
 impl CapitalAllocator {
@@ -59,11 +61,61 @@ impl CapitalAllocator {
         risk_config: RiskConfig,
         default_leverage: u8,
     ) -> Self {
+        // Precompute allocation weights based on concentration factor
+        let allocation_weights =
+            Self::compute_allocation_weights(capital_config.allocation_concentration);
+
         Self {
             capital_config,
             risk_config,
             default_leverage,
+            allocation_weights,
         }
+    }
+
+    /// Compute allocation weights based on concentration factor.
+    ///
+    /// concentration = 1.0: Equal weights [20%, 20%, 20%, 20%, 20%]
+    /// concentration = 1.5: Moderate [~35%, ~25%, ~18%, ~13%, ~9%]
+    /// concentration = 2.0: Geometric [50%, 25%, 12.5%, 6.25%, 6.25%]
+    fn compute_allocation_weights(concentration: Decimal) -> Vec<Decimal> {
+        let max_positions = 5;
+        let mut weights = Vec::with_capacity(max_positions);
+
+        if concentration <= Decimal::ONE {
+            // Equal weighting
+            let equal_weight = Decimal::ONE / Decimal::from(max_positions);
+            for _ in 0..max_positions {
+                weights.push(equal_weight);
+            }
+        } else {
+            // Geometric-style weighting with concentration factor
+            // Higher concentration = more weight on top positions
+            let decay = Decimal::ONE / concentration;
+            let mut remaining = Decimal::ONE;
+
+            for i in 0..max_positions {
+                let weight = if i == max_positions - 1 {
+                    // Last position gets all remaining
+                    remaining
+                } else {
+                    // Weight decreases geometrically
+                    let w = remaining * (Decimal::ONE - decay);
+                    remaining -= w;
+                    w
+                };
+                weights.push(weight);
+            }
+        }
+
+        // Log computed weights for debugging
+        tracing::debug!(
+            concentration = %concentration,
+            weights = ?weights.iter().map(|w| format!("{:.1}%", w * dec!(100))).collect::<Vec<_>>(),
+            "Computed allocation weights"
+        );
+
+        weights
     }
 
     /// Calculate optimal allocation for qualified pairs.
@@ -302,19 +354,18 @@ impl CapitalAllocator {
         reductions
     }
 
-    /// Convert pair score to allocation weight.
+    /// Convert pair score to allocation weight using precomputed concentration weights.
     fn score_to_weight(&self, score: Decimal, rank: usize) -> Decimal {
-        // Higher ranked pairs get larger allocations
-        // Top pair: ~30%, second: ~25%, third: ~20%, etc.
-        let base_weight = match rank {
-            0 => dec!(0.30),
-            1 => dec!(0.25),
-            2 => dec!(0.20),
-            3 => dec!(0.15),
-            _ => dec!(0.10),
+        // Get base weight from precomputed weights (based on concentration factor)
+        let base_weight = if rank < self.allocation_weights.len() {
+            self.allocation_weights[rank]
+        } else {
+            // For positions beyond our precomputed list, use the last weight
+            *self.allocation_weights.last().unwrap_or(&dec!(0.05))
         };
 
         // Adjust by score (normalized around 1.0)
+        // This allows exceptional scores to boost allocation slightly
         let score_factor = (score / dec!(10)).min(dec!(1.5));
         base_weight * score_factor
     }
@@ -348,6 +399,7 @@ mod tests {
                 reserve_buffer: dec!(0.10),
                 min_position_size: dec!(1000),
                 rebalance_threshold: dec!(0.20),
+                allocation_concentration: dec!(1.5), // Moderate concentration
             },
             RiskConfig {
                 max_drawdown: dec!(0.05),
@@ -544,12 +596,83 @@ mod tests {
     fn test_score_to_weight_capped() {
         let allocator = test_allocator();
 
-        // Very high score should be capped at 1.5x base
+        // Very high score should be capped at 1.5x base weight
+        // With concentration=1.5, rank 0 base weight is ~33.3%
         let weight_max = allocator.score_to_weight(dec!(100), 0);
-        let base_weight = dec!(0.30); // Rank 0 base weight
+        let base_weight = allocator.allocation_weights[0];
         let max_factor = dec!(1.5);
 
-        assert!(weight_max <= base_weight * max_factor);
+        assert!(
+            weight_max <= base_weight * max_factor,
+            "weight_max {} should be <= {} (base {} * factor {})",
+            weight_max,
+            base_weight * max_factor,
+            base_weight,
+            max_factor
+        );
+    }
+
+    #[test]
+    fn test_concentration_weights_sum_to_one() {
+        // Test that weights always sum to 1.0 for different concentration values
+        for concentration in [dec!(1.0), dec!(1.5), dec!(2.0), dec!(2.5)] {
+            let weights = CapitalAllocator::compute_allocation_weights(concentration);
+            let sum: Decimal = weights.iter().sum();
+            assert!(
+                (sum - Decimal::ONE).abs() < dec!(0.0001),
+                "Weights should sum to 1.0 for concentration {}, got {}",
+                concentration,
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_concentration_weights_ordering() {
+        // With concentration > 1.0, weights should decrease (mostly) by rank
+        let weights = CapitalAllocator::compute_allocation_weights(dec!(1.5));
+
+        // First position should have highest weight
+        assert!(weights[0] > weights[1], "Rank 0 should have higher weight than rank 1");
+        assert!(weights[1] > weights[2], "Rank 1 should have higher weight than rank 2");
+        assert!(weights[2] > weights[3], "Rank 2 should have higher weight than rank 3");
+    }
+
+    #[test]
+    fn test_equal_concentration_gives_equal_weights() {
+        // Concentration = 1.0 should give equal weights
+        let weights = CapitalAllocator::compute_allocation_weights(dec!(1.0));
+
+        let expected = dec!(0.2); // 20% each for 5 positions
+        for (i, &weight) in weights.iter().enumerate() {
+            assert!(
+                (weight - expected).abs() < dec!(0.0001),
+                "Weight {} should be {} for equal concentration, got {}",
+                i,
+                expected,
+                weight
+            );
+        }
+    }
+
+    #[test]
+    fn test_high_concentration_concentrates_capital() {
+        // Concentration = 2.0 should heavily concentrate on first position
+        let weights = CapitalAllocator::compute_allocation_weights(dec!(2.0));
+
+        // First position should get ~50%
+        assert!(
+            weights[0] > dec!(0.45),
+            "First position should get >45% with concentration 2.0, got {}%",
+            weights[0] * dec!(100)
+        );
+
+        // Second position should get ~25%
+        assert!(
+            weights[1] > dec!(0.20) && weights[1] < dec!(0.30),
+            "Second position should get 20-30% with concentration 2.0, got {}%",
+            weights[1] * dec!(100)
+        );
     }
 
     // =========================================================================

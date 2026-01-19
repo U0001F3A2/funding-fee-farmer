@@ -54,6 +54,12 @@ pub struct CapitalConfig {
     /// Default 0.2 = 20% drift triggers reduction
     #[serde(default = "default_rebalance_threshold")]
     pub rebalance_threshold: Decimal,
+    /// Allocation concentration factor (1.0-3.0)
+    /// 1.0 = equal weighting across positions
+    /// 2.0 = geometric weighting (50%, 25%, 12.5%, ...)
+    /// 1.5 = moderate concentration (recommended, ~35%, 25%, 20%, ...)
+    #[serde(default = "default_allocation_concentration")]
+    pub allocation_concentration: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +178,10 @@ fn default_rebalance_threshold() -> Decimal {
     Decimal::new(20, 2) // 0.20 = 20% drift triggers reduction
 }
 
+fn default_allocation_concentration() -> Decimal {
+    Decimal::new(15, 1) // 1.5 = moderate concentration (~35%, 25%, 20%, 12%, 8%)
+}
+
 fn default_max_drawdown() -> Decimal {
     Decimal::new(5, 2) // 0.05
 }
@@ -181,7 +191,7 @@ fn default_min_margin_ratio() -> Decimal {
 }
 
 fn default_max_single_position() -> Decimal {
-    Decimal::new(30, 2) // 0.30
+    Decimal::new(35, 2) // 0.35 - allows concentrated allocation on top pair
 }
 
 fn default_min_volume() -> Decimal {
@@ -331,6 +341,7 @@ impl Default for Config {
                 reserve_buffer: default_reserve_buffer(),
                 min_position_size: default_min_position_size(),
                 rebalance_threshold: default_rebalance_threshold(),
+                allocation_concentration: default_allocation_concentration(),
             },
             risk: RiskConfig {
                 max_drawdown: default_max_drawdown(),
@@ -385,6 +396,7 @@ impl Default for CapitalConfig {
             reserve_buffer: default_reserve_buffer(),
             min_position_size: default_min_position_size(),
             rebalance_threshold: default_rebalance_threshold(),
+            allocation_concentration: default_allocation_concentration(),
         }
     }
 }
