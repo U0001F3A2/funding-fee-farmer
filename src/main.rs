@@ -297,15 +297,13 @@ async fn main() -> Result<()> {
             let position_value = pos.futures_qty.abs() * pos.futures_entry_price;
 
             // Create entry for position tracker
-            // Note: expected_funding_rate is unknown for restored positions,
-            // but the tracker uses this primarily for expected funding calculations.
-            // We set it to 0 since actual funding is already tracked in total_funding_received.
+            // Use the persisted expected_funding_rate for accurate anomaly detection
             let entry = PositionEntry {
                 symbol: symbol.clone(),
                 entry_price: pos.futures_entry_price,
                 quantity: pos.futures_qty.abs(),
                 position_value,
-                expected_funding_rate: Decimal::ZERO, // Unknown for restored positions
+                expected_funding_rate: pos.expected_funding_rate, // Restored from persistence
                 entry_fees: position_value * dec!(0.0004), // Estimate ~0.04% taker fee
                 opened_at: Some(pos.opened_at), // Use original opened_at for proper grace period
             };
@@ -682,6 +680,11 @@ async fn main() -> Result<()> {
                             opened_at: None, // New position - use current time
                         };
                         risk_orchestrator.open_position(entry);
+
+                        // Persist expected funding rate to MockPosition for state restoration
+                        mock_client
+                            .set_expected_funding_rate(&alloc.symbol, alloc.funding_rate)
+                            .await;
                     }
                 } else {
                     // LIVE TRADING EXECUTION
@@ -1791,6 +1794,34 @@ async fn main() -> Result<()> {
             // Check halt conditions
             if risk_result.should_halt {
                 error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");
+                error!("🚨 [HALT] Initiating emergency close of ALL positions before shutdown...");
+
+                // Re-fetch positions for emergency close (in case they changed during risk actions)
+                let positions_to_close = mock_client.get_delta_neutral_positions().await;
+
+                if !positions_to_close.is_empty() {
+                    let closed = execute_emergency_close_all(
+                        &mock_client,
+                        &positions_to_close,
+                        &mut risk_orchestrator,
+                    ).await;
+
+                    error!(
+                        "🚨 [HALT] Emergency close completed: {}/{} positions closed",
+                        closed, positions_to_close.len()
+                    );
+
+                    // Save state after emergency close
+                    let state_to_save = mock_client.export_state().await;
+                    if let Err(e) = persistence.save_state(&state_to_save) {
+                        error!("❌ [HALT] Failed to save state after emergency close: {}", e);
+                    } else {
+                        info!("✅ [HALT] State saved after emergency close");
+                    }
+                } else {
+                    info!("ℹ️ [HALT] No positions to close");
+                }
+
                 break;
             }
 
@@ -1841,6 +1872,46 @@ async fn main() -> Result<()> {
 
                 if risk_result.should_halt {
                     error!("🚨 [RISK] CRITICAL: Trading halted by risk orchestrator!");
+                    error!("🚨 [HALT] Initiating emergency close of ALL positions before shutdown...");
+
+                    // Close all live positions
+                    for pos in &live_positions {
+                        if pos.position_amt == Decimal::ZERO {
+                            continue;
+                        }
+
+                        let close_side = if pos.position_amt > Decimal::ZERO {
+                            funding_fee_farmer::exchange::OrderSide::Sell
+                        } else {
+                            funding_fee_farmer::exchange::OrderSide::Buy
+                        };
+
+                        let close_order = funding_fee_farmer::exchange::NewOrder {
+                            symbol: pos.symbol.clone(),
+                            side: close_side,
+                            position_side: None,
+                            order_type: funding_fee_farmer::exchange::OrderType::Market,
+                            quantity: Some(pos.position_amt.abs()),
+                            price: None,
+                            time_in_force: None,
+                            reduce_only: Some(true),
+                            new_client_order_id: None,
+                        };
+
+                        match real_client.place_futures_order(&close_order).await {
+                            Ok(_) => {
+                                info!("✅ [HALT] Emergency closed futures position for {}", pos.symbol);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "🚨 [HALT] FAILED to close futures position for {}: {}",
+                                    pos.symbol, e
+                                );
+                            }
+                        }
+                    }
+
+                    error!("🚨 [HALT] Emergency close complete - manual verification required!");
                     break;
                 }
             }
@@ -2009,6 +2080,157 @@ async fn fetch_prices(
             HashMap::new()
         }
     }
+}
+
+/// Execute emergency close of ALL positions during halt condition.
+/// This function will retry each position close up to max_retries times.
+/// Returns the number of positions successfully closed.
+async fn execute_emergency_close_all(
+    mock_client: &MockBinanceClient,
+    positions: &[funding_fee_farmer::exchange::DeltaNeutralPosition],
+    risk_orchestrator: &mut RiskOrchestrator,
+) -> usize {
+    let total_positions = positions.len();
+    let mut closed_count = 0;
+    let max_retries = 5;
+
+    error!(
+        "🚨 [EMERGENCY] Beginning emergency close of {} positions",
+        total_positions
+    );
+
+    for pos in positions {
+        if pos.futures_qty.abs() < dec!(0.0001) && pos.spot_qty.abs() < dec!(0.0001) {
+            // Skip positions with negligible size
+            closed_count += 1;
+            continue;
+        }
+
+        info!(
+            "🔄 [EMERGENCY] Closing position {} (futures: {}, spot: {})",
+            pos.symbol, pos.futures_qty, pos.spot_qty
+        );
+
+        let mut futures_closed = pos.futures_qty == Decimal::ZERO;
+        let mut spot_closed = pos.spot_qty == Decimal::ZERO;
+
+        // Close futures leg with retries
+        if !futures_closed {
+            let futures_side = if pos.futures_qty > Decimal::ZERO {
+                funding_fee_farmer::exchange::OrderSide::Sell
+            } else {
+                funding_fee_farmer::exchange::OrderSide::Buy
+            };
+
+            for attempt in 1..=max_retries {
+                let futures_order = funding_fee_farmer::exchange::NewOrder {
+                    symbol: pos.symbol.clone(),
+                    side: futures_side.clone(),
+                    position_side: None,
+                    order_type: funding_fee_farmer::exchange::OrderType::Market,
+                    quantity: Some(pos.futures_qty.abs()),
+                    price: None,
+                    time_in_force: None,
+                    reduce_only: Some(true),
+                    new_client_order_id: None,
+                };
+
+                match mock_client.place_futures_order(&futures_order).await {
+                    Ok(_) => {
+                        info!(
+                            "✅ [EMERGENCY] Futures closed for {} on attempt {}",
+                            pos.symbol, attempt
+                        );
+                        futures_closed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let backoff_ms = 100 * 2_u64.pow(attempt.min(5));
+                        warn!(
+                            "⚠️ [EMERGENCY] Futures close attempt {}/{} failed for {}: {} - retrying in {}ms",
+                            attempt, max_retries, pos.symbol, e, backoff_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+
+            if !futures_closed {
+                error!(
+                    "🚨 [EMERGENCY] FAILED to close futures for {} after {} attempts!",
+                    pos.symbol, max_retries
+                );
+            }
+        }
+
+        // Close spot leg with retries
+        if !spot_closed {
+            let spot_side = if pos.spot_qty > Decimal::ZERO {
+                funding_fee_farmer::exchange::OrderSide::Sell
+            } else {
+                funding_fee_farmer::exchange::OrderSide::Buy
+            };
+
+            for attempt in 1..=max_retries {
+                let spot_order = funding_fee_farmer::exchange::MarginOrder {
+                    symbol: pos.spot_symbol.clone(),
+                    side: spot_side.clone(),
+                    order_type: funding_fee_farmer::exchange::OrderType::Market,
+                    quantity: Some(pos.spot_qty.abs()),
+                    price: None,
+                    time_in_force: None,
+                    is_isolated: Some(false),
+                    side_effect_type: Some(
+                        funding_fee_farmer::exchange::SideEffectType::AutoBorrowRepay,
+                    ),
+                };
+
+                match mock_client.place_margin_order(&spot_order).await {
+                    Ok(_) => {
+                        info!(
+                            "✅ [EMERGENCY] Spot closed for {} on attempt {}",
+                            pos.symbol, attempt
+                        );
+                        spot_closed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let backoff_ms = 100 * 2_u64.pow(attempt.min(5));
+                        warn!(
+                            "⚠️ [EMERGENCY] Spot close attempt {}/{} failed for {}: {} - retrying in {}ms",
+                            attempt, max_retries, pos.symbol, e, backoff_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+
+            if !spot_closed {
+                error!(
+                    "🚨 [EMERGENCY] FAILED to close spot for {} after {} attempts!",
+                    pos.symbol, max_retries
+                );
+            }
+        }
+
+        if futures_closed && spot_closed {
+            info!("✅ [EMERGENCY] Position {} fully closed", pos.symbol);
+            risk_orchestrator.close_position(&pos.symbol);
+            closed_count += 1;
+        } else {
+            error!(
+                "🚨 [EMERGENCY] Position {} partially closed (futures: {}, spot: {})",
+                pos.symbol, futures_closed, spot_closed
+            );
+        }
+    }
+
+    error!(
+        "🚨 [EMERGENCY] Emergency close complete: {}/{} positions closed",
+        closed_count, total_positions
+    );
+
+    closed_count
 }
 
 /// Log comprehensive status with risk orchestrator metrics.

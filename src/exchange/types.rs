@@ -272,13 +272,16 @@ pub struct SpotSymbolInfo {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarginAsset {
+    #[serde(rename = "assetName")]
     pub asset: String,
     /// Whether the asset can be borrowed
+    #[serde(rename = "isBorrowable")]
     pub borrowable: bool,
     /// Whether the asset can be used as collateral
+    #[serde(rename = "isMortgageable")]
     pub collateral: bool,
-    /// Margin interest rate (daily)
-    #[serde(default, with = "rust_decimal::serde::str_option")]
+    /// Margin interest rate (daily) - not always present in API response
+    #[serde(default)]
     pub margin_interest_rate: Option<Decimal>,
 }
 

@@ -29,6 +29,8 @@ pub struct PersistedPosition {
     pub total_funding_received: Decimal,
     pub total_interest_paid: Decimal,
     pub funding_collections: u32,
+    /// Expected funding rate at position entry (for anomaly detection)
+    pub expected_funding_rate: Decimal,
 }
 
 /// Persisted trading state.
@@ -89,7 +91,8 @@ impl PersistenceManager {
                 opened_at TEXT NOT NULL,
                 total_funding_received TEXT NOT NULL,
                 total_interest_paid TEXT NOT NULL,
-                funding_collections INTEGER NOT NULL
+                funding_collections INTEGER NOT NULL,
+                expected_funding_rate TEXT NOT NULL DEFAULT '0'
             );
 
             -- Funding events history
@@ -143,6 +146,12 @@ impl PersistenceManager {
             "#,
         )?;
 
+        // Migration: Add expected_funding_rate column if it doesn't exist (for existing DBs)
+        let _ = self.conn.execute(
+            "ALTER TABLE positions ADD COLUMN expected_funding_rate TEXT NOT NULL DEFAULT '0'",
+            [],
+        ); // Ignore error if column already exists
+
         debug!("Database schema initialized");
         Ok(())
     }
@@ -185,8 +194,9 @@ impl PersistenceManager {
                 r#"
                 INSERT INTO positions (symbol, futures_qty, futures_entry_price, spot_qty,
                                        spot_entry_price, borrowed_amount, opened_at,
-                                       total_funding_received, total_interest_paid, funding_collections)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                       total_funding_received, total_interest_paid, funding_collections,
+                                       expected_funding_rate)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 "#,
                 params![
                     pos.symbol,
@@ -199,6 +209,7 @@ impl PersistenceManager {
                     pos.total_funding_received.to_string(),
                     pos.total_interest_paid.to_string(),
                     pos.funding_collections,
+                    pos.expected_funding_rate.to_string(),
                 ],
             )?;
         }
@@ -250,7 +261,7 @@ impl PersistenceManager {
             r#"
             SELECT symbol, futures_qty, futures_entry_price, spot_qty, spot_entry_price,
                    borrowed_amount, opened_at, total_funding_received, total_interest_paid,
-                   funding_collections
+                   funding_collections, expected_funding_rate
             FROM positions
             "#,
         )?;
@@ -279,6 +290,8 @@ impl PersistenceManager {
                         total_interest_paid: Decimal::from_str(&row.get::<_, String>(8)?)
                             .unwrap_or_default(),
                         funding_collections: row.get(9)?,
+                        expected_funding_rate: Decimal::from_str(&row.get::<_, String>(10)?)
+                            .unwrap_or_default(),
                     },
                 ))
             })?
@@ -511,6 +524,7 @@ mod tests {
                 total_funding_received: dec!(10),
                 total_interest_paid: dec!(1),
                 funding_collections: 2,
+                expected_funding_rate: dec!(0.0001), // 0.01% expected funding rate
             },
         );
 

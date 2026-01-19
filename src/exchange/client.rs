@@ -517,9 +517,18 @@ impl BinanceClient {
     }
 
     /// Get all margin assets and their borrowability.
+    /// This endpoint requires signature authentication.
     #[instrument(skip(self))]
     pub async fn get_margin_all_assets(&self) -> Result<Vec<MarginAsset>> {
-        let url = format!("{}/sapi/v1/margin/allAssets", self.spot_base_url);
+        let timestamp = Self::timestamp();
+        let query = format!("timestamp={}", timestamp);
+        let signature = self.sign(&query);
+
+        let url = format!(
+            "{}/sapi/v1/margin/allAssets?{}&signature={}",
+            self.spot_base_url, query, signature
+        );
+
         let response = self
             .retry_with_backoff("get_margin_all_assets", || {
                 self.http
@@ -528,6 +537,17 @@ impl BinanceClient {
                     .send()
             })
             .await?;
+
+        // Check for error response before parsing
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Margin assets API returned error status {}: {}",
+                status,
+                error_text
+            );
+        }
 
         response
             .json()

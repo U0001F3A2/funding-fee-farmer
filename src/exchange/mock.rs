@@ -30,6 +30,8 @@ pub struct MockPosition {
     pub total_interest_paid: Decimal,
     /// Number of funding collections for this position
     pub funding_collections: u32,
+    /// Expected funding rate at position entry (for anomaly detection)
+    pub expected_funding_rate: Decimal,
 }
 
 impl Default for MockPosition {
@@ -45,6 +47,7 @@ impl Default for MockPosition {
             total_funding_received: Decimal::ZERO,
             total_interest_paid: Decimal::ZERO,
             funding_collections: 0,
+            expected_funding_rate: Decimal::ZERO,
         }
     }
 }
@@ -466,6 +469,19 @@ impl MockBinanceClient {
         (realized_pnl, unrealized_pnl)
     }
 
+    /// Set the expected funding rate for a position.
+    /// Call this after position entry to record the expected rate for anomaly detection.
+    pub async fn set_expected_funding_rate(&self, symbol: &str, rate: Decimal) {
+        let mut state = self.state.write().await;
+        if let Some(position) = state.positions.get_mut(symbol) {
+            position.expected_funding_rate = rate;
+            debug!(
+                %symbol, %rate,
+                "Set expected funding rate for position"
+            );
+        }
+    }
+
     /// Export current state for persistence.
     pub async fn export_state(&self) -> PersistedState {
         let state = self.state.read().await;
@@ -487,6 +503,7 @@ impl MockBinanceClient {
                         total_funding_received: pos.total_funding_received,
                         total_interest_paid: pos.total_interest_paid,
                         funding_collections: pos.funding_collections,
+                        expected_funding_rate: pos.expected_funding_rate,
                     },
                 )
             })
@@ -532,6 +549,7 @@ impl MockBinanceClient {
                         total_funding_received: pos.total_funding_received,
                         total_interest_paid: pos.total_interest_paid,
                         funding_collections: pos.funding_collections,
+                        expected_funding_rate: pos.expected_funding_rate,
                     },
                 )
             })
