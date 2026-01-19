@@ -16,7 +16,7 @@ use funding_fee_farmer::risk::{
     RiskOrchestratorConfig,
 };
 use funding_fee_farmer::strategy::{
-    CapitalAllocator, HedgeRebalancer, MarketScanner, OrderExecutor, RebalanceConfig,
+    CapitalAllocator, HedgeRebalancer, MarginContext, MarketScanner, OrderExecutor, RebalanceConfig,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -690,6 +690,38 @@ async fn main() -> Result<()> {
                     // LIVE TRADING EXECUTION
                     let prices = fetch_prices(&real_client, &qualified_pairs).await;
 
+                    // Fetch account balance for pre-entry margin validation
+                    let margin_context = match real_client.get_account_balance().await {
+                        Ok(balances) => {
+                            let usdt_balance = balances
+                                .iter()
+                                .find(|b| b.asset == "USDT")
+                                .map(|b| b.margin_balance)
+                                .unwrap_or(dec!(0));
+
+                            // Calculate total existing position value
+                            // current_positions is HashMap<String, Decimal> where value is USDT position size
+                            let total_position_value: Decimal = current_positions
+                                .values()
+                                .map(|v| v.abs())
+                                .sum();
+
+                            Some(MarginContext {
+                                available_balance: usdt_balance,
+                                margin_balance: usdt_balance,
+                                total_position_value,
+                                min_margin_ratio: config.risk.min_margin_ratio,
+                            })
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch account balance for margin validation: {}. Proceeding without validation.",
+                                e
+                            );
+                            None
+                        }
+                    };
+
                     for alloc in &allocations {
                         let price = prices.get(&alloc.symbol).copied().unwrap_or(dec!(0));
                         if price == Decimal::ZERO {
@@ -697,7 +729,16 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        match executor.enter_position(&real_client, alloc, price).await {
+                        // Use validated entry if margin context available, otherwise fallback
+                        let entry_result = if let Some(ref ctx) = margin_context {
+                            executor
+                                .enter_position_validated(&real_client, alloc, price, ctx)
+                                .await
+                        } else {
+                            executor.enter_position(&real_client, alloc, price).await
+                        };
+
+                        match entry_result {
                             Ok(result) => {
                                 if result.success {
                                     info!("✅ [EXECUTE] Entered position for {}", result.symbol);

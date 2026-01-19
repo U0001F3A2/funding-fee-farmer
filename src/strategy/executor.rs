@@ -10,9 +10,56 @@ use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::collections::HashMap;
+
+/// Pre-entry margin validation context.
+/// Used to validate margin safety before opening new positions.
+#[derive(Debug, Clone)]
+pub struct MarginContext {
+    /// Available balance (USDT)
+    pub available_balance: Decimal,
+    /// Current margin balance (USDT)
+    pub margin_balance: Decimal,
+    /// Total position notional value (USDT)
+    pub total_position_value: Decimal,
+    /// Minimum margin ratio to maintain (e.g., 2.0 = 200%)
+    pub min_margin_ratio: Decimal,
+}
+
+impl MarginContext {
+    /// Calculate projected margin ratio after adding a new position.
+    pub fn projected_margin_ratio(&self, additional_position_value: Decimal) -> Decimal {
+        let new_total = self.total_position_value + additional_position_value;
+        if new_total == Decimal::ZERO {
+            return dec!(999); // No positions = infinite margin
+        }
+        self.margin_balance / new_total
+    }
+
+    /// Check if adding a position would breach margin safety threshold.
+    /// Returns Ok(()) if safe, Err with reason if unsafe.
+    pub fn validate_position_entry(&self, position_value: Decimal) -> Result<()> {
+        let projected = self.projected_margin_ratio(position_value);
+        let safety_buffer = self.min_margin_ratio * dec!(1.2); // 20% safety buffer
+
+        if projected < safety_buffer {
+            return Err(anyhow!(
+                "Position would breach margin safety: projected ratio {:.2}x < required {:.2}x (min {:.2}x + 20% buffer)",
+                projected, safety_buffer, self.min_margin_ratio
+            ));
+        }
+
+        debug!(
+            position_value = %position_value,
+            projected_ratio = %projected,
+            min_required = %safety_buffer,
+            "Margin validation passed"
+        );
+        Ok(())
+    }
+}
 
 /// Handles order execution for funding fee farming positions.
 pub struct OrderExecutor {
@@ -44,10 +91,63 @@ impl OrderExecutor {
         self.precisions = precisions;
     }
 
+    /// Execute a delta-neutral entry with pre-entry margin validation.
+    ///
+    /// This is the preferred entry method for production use. It validates
+    /// margin safety BEFORE placing any orders to prevent margin breaches.
+    ///
+    /// # Arguments
+    /// * `client` - Binance client for order execution
+    /// * `allocation` - Position allocation to execute
+    /// * `current_price` - Current market price for the symbol
+    /// * `margin_context` - Current margin state for validation
+    ///
+    /// # Returns
+    /// * `Ok(EntryResult)` - Entry succeeded or failed with details
+    /// * `Err` - Pre-entry validation failed (no orders placed)
+    pub async fn enter_position_validated(
+        &self,
+        client: &BinanceClient,
+        allocation: &PositionAllocation,
+        current_price: Decimal,
+        margin_context: &MarginContext,
+    ) -> Result<EntryResult> {
+        // PHASE 1.5: Pre-entry margin validation
+        // Validate margin BEFORE placing any orders
+        if let Err(e) = margin_context.validate_position_entry(allocation.target_size_usdt) {
+            error!(
+                symbol = %allocation.symbol,
+                target_size = %allocation.target_size_usdt,
+                error = %e,
+                "❌ Pre-entry margin validation failed - rejecting position"
+            );
+            return Ok(EntryResult {
+                symbol: allocation.symbol.clone(),
+                spot_order: None,
+                futures_order: None,
+                success: false,
+                error: Some(format!("Margin validation failed: {}", e)),
+            });
+        }
+
+        info!(
+            symbol = %allocation.symbol,
+            target_size = %allocation.target_size_usdt,
+            projected_margin = %margin_context.projected_margin_ratio(allocation.target_size_usdt),
+            "✅ Pre-entry margin validation passed"
+        );
+
+        // Proceed with atomic position entry
+        self.enter_position(client, allocation, current_price).await
+    }
+
     /// Execute a delta-neutral entry (spot + futures hedge).
     ///
     /// For positive funding: Long spot + Short futures (we receive funding)
     /// For negative funding: Short spot (margin borrow) + Long futures (we receive funding)
+    ///
+    /// Note: For production use, prefer `enter_position_validated` which includes
+    /// pre-entry margin validation.
     pub async fn enter_position(
         &self,
         client: &BinanceClient,
@@ -873,5 +973,103 @@ mod tests {
         assert_eq!(executor.precisions.len(), 2);
         assert_eq!(executor.precisions.get("BTCUSDT"), Some(&5u8));
         assert_eq!(executor.precisions.get("ETHUSDT"), Some(&4u8));
+    }
+
+    // =========================================================================
+    // Margin Context Tests (Pre-Entry Validation)
+    // =========================================================================
+
+    fn test_margin_context(
+        margin_balance: Decimal,
+        total_position_value: Decimal,
+        min_margin_ratio: Decimal,
+    ) -> MarginContext {
+        MarginContext {
+            available_balance: margin_balance, // Simplified
+            margin_balance,
+            total_position_value,
+            min_margin_ratio,
+        }
+    }
+
+    #[test]
+    fn test_margin_context_projected_ratio_no_positions() {
+        let ctx = test_margin_context(dec!(10000), dec!(0), dec!(2.0));
+
+        // With no positions, adding $5000 should give 10000/5000 = 2.0
+        let ratio = ctx.projected_margin_ratio(dec!(5000));
+        assert_eq!(ratio, dec!(2));
+    }
+
+    #[test]
+    fn test_margin_context_projected_ratio_with_positions() {
+        let ctx = test_margin_context(dec!(10000), dec!(5000), dec!(2.0));
+
+        // With $5000 existing, adding $5000 more = 10000/10000 = 1.0
+        let ratio = ctx.projected_margin_ratio(dec!(5000));
+        assert_eq!(ratio, dec!(1));
+    }
+
+    #[test]
+    fn test_margin_validation_passes_safe_entry() {
+        let ctx = test_margin_context(dec!(10000), dec!(0), dec!(2.0));
+
+        // Adding $3000 position with $10000 margin = 3.33x ratio
+        // Required: 2.0 * 1.2 = 2.4x
+        // 3.33x > 2.4x -> passes
+        let result = ctx.validate_position_entry(dec!(3000));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_margin_validation_fails_unsafe_entry() {
+        let ctx = test_margin_context(dec!(10000), dec!(0), dec!(3.0));
+
+        // Adding $5000 position with $10000 margin = 2.0x ratio
+        // Required: 3.0 * 1.2 = 3.6x
+        // 2.0x < 3.6x -> fails
+        let result = ctx.validate_position_entry(dec!(5000));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("breach margin safety"));
+    }
+
+    #[test]
+    fn test_margin_validation_with_existing_positions() {
+        let ctx = test_margin_context(dec!(10000), dec!(2000), dec!(2.0));
+
+        // Existing: $2000, adding $3000 = $5000 total
+        // Ratio: 10000/5000 = 2.0x
+        // Required: 2.0 * 1.2 = 2.4x
+        // 2.0x < 2.4x -> fails
+        let result = ctx.validate_position_entry(dec!(3000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_margin_validation_exactly_at_threshold() {
+        let ctx = test_margin_context(dec!(10000), dec!(0), dec!(2.0));
+
+        // Required ratio: 2.0 * 1.2 = 2.4x
+        // For 2.4x with $10000 margin: position = 10000/2.4 = 4166.666...
+        // Adding $4000 should give ratio = 2.5x > 2.4x (passes)
+        let result = ctx.validate_position_entry(dec!(4000));
+        assert!(result.is_ok());
+
+        // Adding $4160 should give ratio = ~2.404x > 2.4x (barely passes)
+        let result2 = ctx.validate_position_entry(dec!(4160));
+        assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn test_margin_validation_just_below_threshold() {
+        let ctx = test_margin_context(dec!(10000), dec!(0), dec!(2.0));
+
+        // Required ratio: 2.4x
+        // Adding $4200 = 10000/4200 = 2.38x < 2.4x -> fails
+        let result = ctx.validate_position_entry(dec!(4200));
+        assert!(result.is_err());
     }
 }
