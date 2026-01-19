@@ -59,6 +59,28 @@ jobs:
              chmod +x /home/ec2-user/funding-fee-farmer/funding-fee-farmer && \
              rm /tmp/funding-fee-farmer"
 
+      - name: Create .env file on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ec2-user
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+        run: |
+          # Create .env content locally first (secrets are in env vars)
+          printf '%s\n' \
+            "# Binance API Configuration (managed by GitHub Actions)" \
+            "BINANCE_API_KEY=$BINANCE_API_KEY" \
+            "BINANCE_SECRET_KEY=$BINANCE_SECRET_KEY" \
+            "BINANCE_TESTNET=false" \
+            > /tmp/env_file
+          # Copy to EC2
+          scp -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            /tmp/env_file "$EC2_USER@$EC2_HOST:/home/ec2-user/funding-fee-farmer/.env"
+          # Set permissions
+          ssh -i ~/.ssh/fff-key.pem -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" "chmod 600 /home/ec2-user/funding-fee-farmer/.env"
+          rm -f /tmp/env_file
+
       - name: Start service on EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
