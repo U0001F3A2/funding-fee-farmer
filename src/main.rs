@@ -420,6 +420,20 @@ async fn main() -> Result<()> {
             // Get prices first so we can convert position quantities to USDT values
             let prices = fetch_prices(&real_client, &qualified_pairs).await;
 
+            // CRITICAL: Check if price fetch failed completely
+            // If no prices returned, skip trading to avoid silent failures
+            if prices.is_empty() {
+                error!(
+                    "❌ [PRICES] Failed to fetch prices for {} pairs - API may be unavailable. Skipping trading cycle.",
+                    qualified_pairs.len()
+                );
+                metrics.errors_count += 1;
+                risk_orchestrator.record_error("Price fetch returned empty - API unavailable");
+                // Continue to next cycle instead of making uninformed trades
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+
             // Convert position quantities to USDT values for the allocator
             // The allocator compares target_size (USDT) with current position (must also be USDT)
             let current_positions: HashMap<String, Decimal> = if trading_mode == TradingMode::Mock {

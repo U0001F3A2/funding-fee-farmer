@@ -29,11 +29,16 @@ pub struct MarginContext {
 }
 
 impl MarginContext {
+    /// Minimum position value threshold to prevent division edge cases.
+    /// Positions below $1 are considered negligible.
+    const MIN_POSITION_THRESHOLD: Decimal = dec!(1);
+
     /// Calculate projected margin ratio after adding a new position.
     pub fn projected_margin_ratio(&self, additional_position_value: Decimal) -> Decimal {
         let new_total = self.total_position_value + additional_position_value;
-        if new_total == Decimal::ZERO {
-            return dec!(999); // No positions = infinite margin
+        // Use threshold instead of zero check to prevent edge cases with tiny values
+        if new_total < Self::MIN_POSITION_THRESHOLD {
+            return dec!(999); // Negligible positions = effectively infinite margin
         }
         self.margin_balance / new_total
     }
@@ -336,46 +341,73 @@ impl OrderExecutor {
             .as_ref()
             .map(|o| o.executed_qty)
             .unwrap_or(dec!(0));
-        let delta_diff = (futures_qty - spot_qty).abs();
-        let delta_pct = if futures_qty > dec!(0) {
-            delta_diff / futures_qty * dec!(100)
-        } else {
-            dec!(0)
-        };
 
-        // STRICT THRESHOLD: Max 0.5% delta mismatch allowed (was 5%)
+        // CRITICAL: Minimum quantity threshold to prevent false success
+        // If either leg has negligible fill, the position is not delta neutral
+        const MIN_QTY_THRESHOLD: Decimal = dec!(0.0001);
+
+        // STRICT THRESHOLD: Max 0.5% delta mismatch allowed
         // For a $10k position, 0.5% = $50 max unhedged exposure
         const MAX_DELTA_PCT: Decimal = dec!(0.5);
         const WARN_DELTA_PCT: Decimal = dec!(0.1);
 
-        if delta_pct > WARN_DELTA_PCT {
-            warn!(
-                %symbol,
-                futures_qty = %futures_qty,
-                spot_qty = %spot_qty,
-                delta_diff_pct = %delta_pct,
-                max_allowed = %MAX_DELTA_PCT,
-                "⚠️ Delta mismatch detected - position partially hedged"
-            );
-        }
-
-        // If delta exceeds strict threshold, attempt gap-fill or fail
-        let (success, error) = if delta_pct > MAX_DELTA_PCT {
-            // Delta too large - this is a problem
+        // First check: ensure both legs have meaningful fills
+        let (success, error) = if futures_qty < MIN_QTY_THRESHOLD {
             error!(
                 %symbol,
-                delta_pct = %delta_pct,
-                max_allowed = %MAX_DELTA_PCT,
                 futures_qty = %futures_qty,
                 spot_qty = %spot_qty,
-                "❌ Delta mismatch exceeds maximum allowed threshold"
+                min_threshold = %MIN_QTY_THRESHOLD,
+                "❌ Futures quantity too small - position not established"
             );
             (false, Some(format!(
-                "Delta mismatch {:.2}% exceeds max allowed {:.2}%. Position has unhedged exposure.",
-                delta_pct, MAX_DELTA_PCT
+                "Futures quantity {} below minimum threshold {}. Position not established.",
+                futures_qty, MIN_QTY_THRESHOLD
+            )))
+        } else if spot_qty < MIN_QTY_THRESHOLD {
+            error!(
+                %symbol,
+                futures_qty = %futures_qty,
+                spot_qty = %spot_qty,
+                min_threshold = %MIN_QTY_THRESHOLD,
+                "❌ Spot quantity too small - position unhedged"
+            );
+            (false, Some(format!(
+                "Spot quantity {} below minimum threshold {}. Position unhedged.",
+                spot_qty, MIN_QTY_THRESHOLD
             )))
         } else {
-            (true, None)
+            // Both legs have meaningful fills - check delta percentage
+            let delta_diff = (futures_qty - spot_qty).abs();
+            let delta_pct = delta_diff / futures_qty * dec!(100);
+
+            if delta_pct > WARN_DELTA_PCT {
+                warn!(
+                    %symbol,
+                    futures_qty = %futures_qty,
+                    spot_qty = %spot_qty,
+                    delta_diff_pct = %delta_pct,
+                    max_allowed = %MAX_DELTA_PCT,
+                    "⚠️ Delta mismatch detected - position partially hedged"
+                );
+            }
+
+            if delta_pct > MAX_DELTA_PCT {
+                error!(
+                    %symbol,
+                    delta_pct = %delta_pct,
+                    max_allowed = %MAX_DELTA_PCT,
+                    futures_qty = %futures_qty,
+                    spot_qty = %spot_qty,
+                    "❌ Delta mismatch exceeds maximum allowed threshold"
+                );
+                (false, Some(format!(
+                    "Delta mismatch {:.2}% exceeds max allowed {:.2}%. Position has unhedged exposure.",
+                    delta_pct, MAX_DELTA_PCT
+                )))
+            } else {
+                (true, None)
+            }
         };
 
         Ok(EntryResult {

@@ -129,17 +129,28 @@ impl TrackedPosition {
     }
 
     /// Calculate annualized yield based on current performance.
+    /// Returns ZERO for positions held less than 1 hour to avoid extreme extrapolation.
     pub fn annualized_yield(&self) -> Decimal {
-        if self.position_value == Decimal::ZERO || self.hours_open < 1.0 {
+        // Require at least 1 hour open and minimum position value to avoid extreme yields
+        // Using >= 1.0 prevents inflation from sub-hour positions
+        if self.position_value < dec!(1) || self.hours_open < 1.0 {
             return Decimal::ZERO;
         }
 
         let net = self.net_pnl();
-        let hours_decimal = Decimal::from_f64_retain(self.hours_open).unwrap_or(dec!(1));
-        let hourly_return = net / self.position_value / hours_decimal;
 
-        // Annualize: hourly * 24 * 365
-        hourly_return * dec!(8760)
+        // Safe conversion with floor to avoid fractional hour inflation
+        // A position open 1.5 hours uses 1.5, not 1.99999 from f64 issues
+        let hours_decimal = Decimal::from_f64_retain(self.hours_open)
+            .filter(|h| *h >= dec!(1)) // Ensure at least 1 hour after conversion
+            .unwrap_or(dec!(1));
+
+        // Guard against unrealistic yields (cap at +/- 10000% APY)
+        let hourly_return = net / self.position_value / hours_decimal;
+        let annualized = hourly_return * dec!(8760); // hourly * 24 * 365
+
+        // Clamp to reasonable bounds to prevent extreme values from triggering false alerts
+        annualized.clamp(dec!(-100), dec!(100)) // -10000% to +10000% APY
     }
 
     /// Check if position is within grace period.
