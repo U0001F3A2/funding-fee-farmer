@@ -247,22 +247,24 @@ async fn main() -> Result<()> {
     // Try to restore previous state
     // Clone positions before restore_state consumes the persisted_state
     // These will be registered with the risk orchestrator's position tracker
-    let (initial_balance, restored_positions) =
+    let (initial_balance, restored_positions, restored_funding_period) =
         if let Ok(Some(persisted_state)) = persistence.load_state() {
             info!("📂 [PERSISTENCE] Restoring state from database");
             info!(
-                "   Balance: ${:.2}, Positions: {}, Total Funding: ${:.4}",
+                "   Balance: ${:.2}, Positions: {}, Total Funding: ${:.4}, Last Funding Period: {:?}",
                 persisted_state.balance,
                 persisted_state.positions.len(),
-                persisted_state.total_funding_received
+                persisted_state.total_funding_received,
+                persisted_state.last_funding_period
             );
             let balance = persisted_state.balance;
             let positions = persisted_state.positions.clone();
+            let funding_period = persisted_state.last_funding_period;
             mock_client.restore_state(persisted_state).await;
-            (balance, positions)
+            (balance, positions, funding_period)
         } else {
             info!("📂 [PERSISTENCE] No previous state found, starting fresh with $10,000");
-            (dec!(10000), HashMap::new())
+            (dec!(10000), HashMap::new(), None)
         };
 
     // Initialize RiskOrchestrator with comprehensive risk monitoring
@@ -360,9 +362,20 @@ async fn main() -> Result<()> {
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // Track last funding collection time and state saves
-    let mut last_funding_hour: Option<u32> = None;
+    // Funding period ID: day_of_year * 3 + period_of_day (0, 1, or 2 for 0:00, 8:00, 16:00 UTC)
+    // This prevents double-collection across restarts
+    let mut last_funding_period: Option<u32> = restored_funding_period;
     let mut last_status_log = Utc::now();
     let mut last_state_save = Utc::now();
+
+    // Helper function to calculate funding period ID
+    fn get_funding_period_id(dt: DateTime<Utc>) -> u32 {
+        use chrono::Datelike;
+        let day = dt.ordinal(); // Day of year (1-366)
+        let hour = dt.hour();
+        let period = hour / 8; // 0, 1, or 2
+        day * 3 + period
+    }
 
     // Main trading loop
     while !shutdown.load(Ordering::SeqCst) {
@@ -1308,10 +1321,13 @@ async fn main() -> Result<()> {
         // ═══════════════════════════════════════════════════════════════
         // PHASE 6: Funding Collection & Verification
         // ═══════════════════════════════════════════════════════════════
-        let current_hour = Utc::now().hour();
+        // Use funding period ID to prevent double-collection across restarts
+        let now = Utc::now();
+        let current_hour = now.hour();
         let is_funding_hour = current_hour == 0 || current_hour == 8 || current_hour == 16;
+        let current_funding_period = get_funding_period_id(now);
 
-        if is_funding_hour && last_funding_hour != Some(current_hour) {
+        if is_funding_hour && last_funding_period != Some(current_funding_period) {
             if trading_mode == TradingMode::Mock {
                 info!("💸 [FUNDING] Collecting funding payments...");
                 let per_position_funding = mock_client.collect_funding().await;
@@ -1343,20 +1359,22 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Update funding period BEFORE saving state (ensures it's persisted)
+            last_funding_period = Some(current_funding_period);
+
             // Save state after funding collection (critical checkpoint)
             if trading_mode == TradingMode::Mock {
-                let state_to_save = mock_client.export_state().await;
+                let mut state_to_save = mock_client.export_state().await;
+                state_to_save.last_funding_period = last_funding_period;
                 if let Err(e) = persistence.save_state(&state_to_save) {
                     warn!(
                         "⚠️  [PERSISTENCE] Failed to save state after funding: {}",
                         e
                     );
                 } else {
-                    debug!("💾 [PERSISTENCE] State saved after funding collection");
+                    debug!("💾 [PERSISTENCE] State saved after funding collection (period {})", current_funding_period);
                 }
             }
-
-            last_funding_hour = Some(current_hour);
         }
 
         // Accrue interest periodically
@@ -1888,7 +1906,8 @@ async fn main() -> Result<()> {
                     );
 
                     // Save state after emergency close
-                    let state_to_save = mock_client.export_state().await;
+                    let mut state_to_save = mock_client.export_state().await;
+                    state_to_save.last_funding_period = last_funding_period;
                     if let Err(e) = persistence.save_state(&state_to_save) {
                         error!("❌ [HALT] Failed to save state after emergency close: {}", e);
                     } else {
@@ -1997,7 +2016,8 @@ async fn main() -> Result<()> {
         if trading_mode == TradingMode::Mock {
             let now = Utc::now();
             if (now - last_state_save).num_minutes() >= 60 {
-                let state_to_save = mock_client.export_state().await;
+                let mut state_to_save = mock_client.export_state().await;
+                state_to_save.last_funding_period = last_funding_period;
                 if let Err(e) = persistence.save_state(&state_to_save) {
                     warn!("⚠️  [PERSISTENCE] Failed periodic state save: {}", e);
                 } else {
@@ -2029,7 +2049,8 @@ async fn main() -> Result<()> {
     // Save final state before shutdown
     if trading_mode == TradingMode::Mock {
         info!("💾 [PERSISTENCE] Saving final state before shutdown...");
-        let state_to_save = mock_client.export_state().await;
+        let mut state_to_save = mock_client.export_state().await;
+        state_to_save.last_funding_period = last_funding_period;
         if let Err(e) = persistence.save_state(&state_to_save) {
             error!("❌ [PERSISTENCE] Failed to save final state: {}", e);
         } else {

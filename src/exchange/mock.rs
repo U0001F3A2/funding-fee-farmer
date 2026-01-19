@@ -518,6 +518,8 @@ impl MockBinanceClient {
             order_count: state.order_count,
             positions,
             last_saved: Utc::now(),
+            // Note: last_funding_period is managed by main.rs and should be set by caller
+            last_funding_period: None,
         }
     }
 

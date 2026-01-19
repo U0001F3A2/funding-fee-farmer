@@ -44,6 +44,8 @@ pub struct PersistedState {
     pub order_count: u64,
     pub positions: HashMap<String, PersistedPosition>,
     pub last_saved: DateTime<Utc>,
+    /// Last funding period ID (day_of_year * 3 + period_of_day) to prevent double-collection
+    pub last_funding_period: Option<u32>,
 }
 
 /// SQLite-based persistence manager.
@@ -77,7 +79,8 @@ impl PersistenceManager {
                 total_trading_fees TEXT NOT NULL,
                 total_borrow_interest TEXT NOT NULL,
                 order_count INTEGER NOT NULL,
-                last_saved TEXT NOT NULL
+                last_saved TEXT NOT NULL,
+                last_funding_period INTEGER
             );
 
             -- Positions
@@ -152,6 +155,12 @@ impl PersistenceManager {
             [],
         ); // Ignore error if column already exists
 
+        // Migration: Add last_funding_period column if it doesn't exist (for existing DBs)
+        let _ = self.conn.execute(
+            "ALTER TABLE trading_state ADD COLUMN last_funding_period INTEGER",
+            [],
+        ); // Ignore error if column already exists
+
         debug!("Database schema initialized");
         Ok(())
     }
@@ -164,8 +173,9 @@ impl PersistenceManager {
         tx.execute(
             r#"
             INSERT INTO trading_state (id, initial_balance, balance, total_funding_received,
-                                       total_trading_fees, total_borrow_interest, order_count, last_saved)
-            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                       total_trading_fees, total_borrow_interest, order_count, last_saved,
+                                       last_funding_period)
+            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(id) DO UPDATE SET
                 initial_balance = ?1,
                 balance = ?2,
@@ -173,7 +183,8 @@ impl PersistenceManager {
                 total_trading_fees = ?4,
                 total_borrow_interest = ?5,
                 order_count = ?6,
-                last_saved = ?7
+                last_saved = ?7,
+                last_funding_period = ?8
             "#,
             params![
                 state.initial_balance.to_string(),
@@ -183,6 +194,7 @@ impl PersistenceManager {
                 state.total_borrow_interest.to_string(),
                 state.order_count,
                 state.last_saved.to_rfc3339(),
+                state.last_funding_period,
             ],
         )?;
 
@@ -227,12 +239,12 @@ impl PersistenceManager {
     /// Load the trading state from database.
     pub fn load_state(&self) -> Result<Option<PersistedState>> {
         // Load trading state
-        let state_row: Option<(String, String, String, String, String, u64, String)> = self
+        let state_row: Option<(String, String, String, String, String, u64, String, Option<u32>)> = self
             .conn
             .query_row(
                 r#"
                 SELECT initial_balance, balance, total_funding_received, total_trading_fees,
-                       total_borrow_interest, order_count, last_saved
+                       total_borrow_interest, order_count, last_saved, last_funding_period
                 FROM trading_state WHERE id = 1
                 "#,
                 [],
@@ -245,12 +257,13 @@ impl PersistenceManager {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((initial_balance, balance, funding, fees, interest, order_count, last_saved)) =
+        let Some((initial_balance, balance, funding, fees, interest, order_count, last_saved, last_funding_period)) =
             state_row
         else {
             return Ok(None);
@@ -309,12 +322,14 @@ impl PersistenceManager {
             last_saved: DateTime::parse_from_rfc3339(&last_saved)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
+            last_funding_period,
         };
 
         info!(
             balance = %state.balance,
             positions = state.positions.len(),
             last_saved = %state.last_saved,
+            last_funding_period = ?state.last_funding_period,
             "Loaded state from database"
         );
 
@@ -537,6 +552,7 @@ mod tests {
             order_count: 4,
             positions,
             last_saved: Utc::now(),
+            last_funding_period: Some(42),
         };
 
         manager.save_state(&state).unwrap();
@@ -545,6 +561,7 @@ mod tests {
         assert_eq!(loaded.balance, dec!(10009));
         assert_eq!(loaded.positions.len(), 1);
         assert_eq!(loaded.positions["BTCUSDT"].futures_qty, dec!(-0.1));
+        assert_eq!(loaded.last_funding_period, Some(42));
     }
 
     #[test]
