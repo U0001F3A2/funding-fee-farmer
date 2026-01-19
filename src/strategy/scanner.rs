@@ -3,6 +3,7 @@
 use crate::config::PairSelectionConfig;
 use crate::exchange::{BinanceClient, FundingRate, MarginAsset, QualifiedPair, SpotSymbolInfo};
 use anyhow::Result;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -21,9 +22,53 @@ enum RejectReason {
     MissingData,
 }
 
+/// Details about a near-miss opportunity for diagnostic logging.
+#[derive(Debug, Clone)]
+struct NearMissOpportunity {
+    symbol: String,
+    funding_rate: Decimal,
+    rejection_reason: String,
+    actual_value: String,
+    threshold: String,
+    /// Proximity score: higher = closer to qualifying (0-100)
+    proximity: u8,
+}
+
 /// Scans the market for profitable funding rate opportunities.
 pub struct MarketScanner {
     config: PairSelectionConfig,
+}
+
+/// Calculate a proximity score (0-100) for how close a value is to reaching a threshold.
+/// Higher score = closer to qualifying.
+fn calculate_percentage_proximity(actual: Decimal, threshold: Decimal) -> u8 {
+    if threshold.is_zero() {
+        return 100;
+    }
+    let ratio = actual / threshold;
+    // Convert to 0-100 scale, capped at 100
+    (ratio * dec!(100)).to_u8().unwrap_or(100).min(100)
+}
+
+/// Calculate proximity for inverse thresholds (where lower is better, e.g., spread).
+fn calculate_inverse_proximity(actual: Decimal, threshold: Decimal) -> u8 {
+    if actual.is_zero() {
+        return 100;
+    }
+    let ratio = threshold / actual;
+    (ratio * dec!(100)).to_u8().unwrap_or(0).min(100)
+}
+
+/// Calculate proximity score based on funding rate significance.
+fn calculate_proximity_score(funding_rate: Decimal, min_funding_rate: Decimal) -> u8 {
+    if min_funding_rate.is_zero() {
+        return 100;
+    }
+    // Higher funding rates get higher proximity scores
+    let ratio = funding_rate / min_funding_rate;
+    // Scale: 1x threshold = 50, 2x = 75, 4x = 100
+    let score = dec!(50) + (ratio - dec!(1)) * dec!(25);
+    score.to_u8().unwrap_or(50).clamp(0, 100)
 }
 
 /// Get fallback borrow rate for an asset when margin data is unavailable.
@@ -137,11 +182,14 @@ impl MarketScanner {
         let mut rejected_low_net_funding = 0usize;
         let mut rejected_missing_data = 0usize;
 
+        // Track near-miss opportunities for diagnostic logging
+        let mut near_misses: Vec<NearMissOpportunity> = Vec::new();
+
         // Filter and score pairs
         let mut qualified: Vec<QualifiedPair> = funding_rates
             .iter()
             .filter_map(|fr| {
-                match self.qualify_pair_with_reason(
+                match self.qualify_pair_with_details(
                     fr,
                     &volume_map,
                     &spread_map,
@@ -149,7 +197,7 @@ impl MarketScanner {
                     &margin_asset_map,
                 ) {
                     Ok(pair) => Some(pair),
-                    Err(reason) => {
+                    Err((reason, near_miss)) => {
                         match reason {
                             RejectReason::NotUsdt => rejected_no_usdt += 1,
                             RejectReason::NoMargin => rejected_no_margin += 1,
@@ -159,6 +207,10 @@ impl MarketScanner {
                             RejectReason::LowFunding => rejected_low_funding += 1,
                             RejectReason::LowNetFunding => rejected_low_net_funding += 1,
                             RejectReason::MissingData => rejected_missing_data += 1,
+                        }
+                        // Collect near-misses (only for pairs that got past initial filters)
+                        if let Some(nm) = near_miss {
+                            near_misses.push(nm);
                         }
                         None
                     }
@@ -184,23 +236,44 @@ impl MarketScanner {
             "Market scan complete"
         );
 
+        // Log near-miss opportunities when few pairs qualify (for diagnostic visibility)
+        if qualified.len() < 3 && !near_misses.is_empty() {
+            // Sort near-misses by proximity (highest = closest to qualifying)
+            near_misses.sort_by(|a, b| b.proximity.cmp(&a.proximity));
+
+            // Take top 5 near-misses
+            let top_near_misses: Vec<_> = near_misses.into_iter().take(5).collect();
+
+            info!("📊 Top near-miss opportunities (closest to qualifying):");
+            for nm in &top_near_misses {
+                info!(
+                    "   {} | funding={:.4}% | rejected: {} (actual={}, threshold={})",
+                    nm.symbol,
+                    nm.funding_rate * dec!(100),
+                    nm.rejection_reason,
+                    nm.actual_value,
+                    nm.threshold
+                );
+            }
+        }
+
         Ok(qualified)
     }
 
-    /// Check if a pair qualifies and calculate its score, returning rejection reason if not.
-    fn qualify_pair_with_reason(
+    /// Check if a pair qualifies with detailed rejection info for near-miss tracking.
+    fn qualify_pair_with_details(
         &self,
         funding: &FundingRate,
         volume_map: &HashMap<String, Decimal>,
         spread_map: &HashMap<String, Decimal>,
         spot_margin_map: &HashMap<String, &SpotSymbolInfo>,
         margin_asset_map: &HashMap<String, &MarginAsset>,
-    ) -> Result<QualifiedPair, RejectReason> {
+    ) -> Result<QualifiedPair, (RejectReason, Option<NearMissOpportunity>)> {
         let symbol = &funding.symbol;
 
-        // Must be USDT perpetual
+        // Must be USDT perpetual - early filter, not a near-miss
         if !symbol.ends_with("USDT") {
-            return Err(RejectReason::NotUsdt);
+            return Err((RejectReason::NotUsdt, None));
         }
 
         // Derive spot symbol (same as futures for USDT pairs)
@@ -209,7 +282,7 @@ impl MarketScanner {
         // Extract base asset (e.g., "BTC" from "BTCUSDT")
         let base_asset = symbol
             .strip_suffix("USDT")
-            .ok_or(RejectReason::NotUsdt)?
+            .ok_or((RejectReason::NotUsdt, None))?
             .to_string();
 
         // Check if spot margin trading is available
@@ -220,7 +293,8 @@ impl MarketScanner {
 
         if !margin_available {
             trace!(symbol, "No spot margin trading available - cannot hedge");
-            return Err(RejectReason::NoMargin);
+            // This is an infrastructure limitation, not a near-miss
+            return Err((RejectReason::NoMargin, None));
         }
 
         // Check if base asset is borrowable (needed for shorting spot)
@@ -228,9 +302,6 @@ impl MarketScanner {
         let borrow_rate = margin_asset.and_then(|a| a.margin_interest_rate);
 
         // For negative funding rates, we need to short spot (borrow base asset)
-        // Check that the asset is in the margin system and is borrowable.
-        // Note: We use fallback rates if actual rate data is unavailable (common since
-        // /sapi/v1/margin/allAssets doesn't include interest rates).
         if funding.funding_rate < Decimal::ZERO {
             if margin_asset.is_none() {
                 trace!(
@@ -239,39 +310,85 @@ impl MarketScanner {
                     funding_rate = %funding.funding_rate,
                     "Rejecting: negative funding requires borrowing, but asset not in margin system"
                 );
-                return Err(RejectReason::NotBorrowable);
+                // Track as near-miss if funding rate is significant
+                return Err((
+                    RejectReason::NotBorrowable,
+                    Some(NearMissOpportunity {
+                        symbol: symbol.clone(),
+                        funding_rate: funding.funding_rate,
+                        rejection_reason: "not_borrowable".to_string(),
+                        actual_value: format!("funding={:.4}%", funding.funding_rate.abs() * dec!(100)),
+                        threshold: "requires margin borrowing".to_string(),
+                        proximity: calculate_proximity_score(funding.funding_rate.abs(), self.config.min_funding_rate),
+                    }),
+                ));
             }
-            // Asset is borrowable - we'll use fallback rates if actual rate is unavailable
-            // The net funding check below will still reject if borrow costs are too high
         }
 
         // Get volume
-        let volume = *volume_map.get(symbol).ok_or(RejectReason::MissingData)?;
+        let volume = match volume_map.get(symbol) {
+            Some(&v) => v,
+            None => return Err((RejectReason::MissingData, None)),
+        };
+
         if volume < self.config.min_volume_24h {
             trace!(symbol, %volume, "Volume below threshold");
-            return Err(RejectReason::LowVolume);
+            let proximity = calculate_percentage_proximity(volume, self.config.min_volume_24h);
+            return Err((
+                RejectReason::LowVolume,
+                Some(NearMissOpportunity {
+                    symbol: symbol.clone(),
+                    funding_rate: funding.funding_rate,
+                    rejection_reason: "low_volume".to_string(),
+                    actual_value: format!("${:.0}M", volume / dec!(1_000_000)),
+                    threshold: format!("${:.0}M", self.config.min_volume_24h / dec!(1_000_000)),
+                    proximity,
+                }),
+            ));
         }
 
         // Get spread
-        let spread = *spread_map.get(symbol).ok_or(RejectReason::MissingData)?;
+        let spread = match spread_map.get(symbol) {
+            Some(&s) => s,
+            None => return Err((RejectReason::MissingData, None)),
+        };
+
         if spread > self.config.max_spread {
             trace!(symbol, %spread, "Spread above threshold");
-            return Err(RejectReason::WideSpread);
+            let proximity = calculate_inverse_proximity(spread, self.config.max_spread);
+            return Err((
+                RejectReason::WideSpread,
+                Some(NearMissOpportunity {
+                    symbol: symbol.clone(),
+                    funding_rate: funding.funding_rate,
+                    rejection_reason: "wide_spread".to_string(),
+                    actual_value: format!("{:.4}%", spread * dec!(100)),
+                    threshold: format!("{:.4}%", self.config.max_spread * dec!(100)),
+                    proximity,
+                }),
+            ));
         }
 
         // Check funding rate magnitude
         let funding_rate_abs = funding.funding_rate.abs();
         if funding_rate_abs < self.config.min_funding_rate {
             trace!(symbol, %funding_rate_abs, "Funding rate below threshold");
-            return Err(RejectReason::LowFunding);
+            let proximity = calculate_percentage_proximity(funding_rate_abs, self.config.min_funding_rate);
+            return Err((
+                RejectReason::LowFunding,
+                Some(NearMissOpportunity {
+                    symbol: symbol.clone(),
+                    funding_rate: funding.funding_rate,
+                    rejection_reason: "low_funding".to_string(),
+                    actual_value: format!("{:.4}%", funding_rate_abs * dec!(100)),
+                    threshold: format!("{:.4}%", self.config.min_funding_rate * dec!(100)),
+                    proximity,
+                }),
+            ));
         }
 
         // Calculate net profitability considering borrow costs
-        // If funding > 0: Short perp, long spot (no borrow needed)
-        // If funding < 0: Long perp, short spot (need to borrow base asset)
         let borrow_cost_per_8h = if funding.funding_rate < Decimal::ZERO {
-            // Need to short spot, calculate borrow cost
-            // Daily rate / 3 = 8-hour rate (funding settlement period)
             let daily_rate = borrow_rate.unwrap_or_else(|| {
                 let fallback =
                     get_fallback_borrow_rate(&base_asset, self.config.default_borrow_rate);
@@ -291,7 +408,6 @@ impl MarketScanner {
         let net_funding = funding_rate_abs - borrow_cost_per_8h;
 
         // CRITICAL: Reject pairs where net funding (after borrow costs) is too low
-        // This prevents entering positions like STOUSDT where borrow costs exceed funding income
         if net_funding < self.config.min_net_funding {
             warn!(
                 symbol,
@@ -301,13 +417,26 @@ impl MarketScanner {
                 min_required = %self.config.min_net_funding,
                 "Rejecting: net funding too low after borrow costs"
             );
-            return Err(RejectReason::LowNetFunding);
+            let proximity = calculate_percentage_proximity(net_funding.max(Decimal::ZERO), self.config.min_net_funding);
+            return Err((
+                RejectReason::LowNetFunding,
+                Some(NearMissOpportunity {
+                    symbol: symbol.clone(),
+                    funding_rate: funding.funding_rate,
+                    rejection_reason: "low_net_funding".to_string(),
+                    actual_value: format!("{:.4}% (funding) - {:.4}% (borrow) = {:.4}%",
+                        funding_rate_abs * dec!(100),
+                        borrow_cost_per_8h * dec!(100),
+                        net_funding * dec!(100)),
+                    threshold: format!("{:.4}%", self.config.min_net_funding * dec!(100)),
+                    proximity,
+                }),
+            ));
         }
 
         // Calculate score - prioritize net profitability
-        // Score = (Net Funding × 0.5) + (Volume_normalized × 0.25) + (1/Spread × 0.2) + (Margin Safety × 0.05)
-        let funding_score = net_funding * dec!(10000); // Scale for comparison
-        let volume_score = (volume / dec!(1_000_000_000)).min(dec!(1)); // Cap at 1B
+        let funding_score = net_funding * dec!(10000);
+        let volume_score = (volume / dec!(1_000_000_000)).min(dec!(1));
         let spread_score = dec!(1) / (spread * dec!(10000) + dec!(1));
         let margin_safety = if margin_asset.is_some() {
             dec!(1)
@@ -336,14 +465,14 @@ impl MarketScanner {
             funding_rate: funding.funding_rate,
             volume_24h: volume,
             spread,
-            open_interest: Decimal::ZERO, // TODO: Fetch separately if needed
+            open_interest: Decimal::ZERO,
             margin_available,
             borrow_rate,
             score,
         })
     }
 
-    /// Check if a pair qualifies and calculate its score (legacy wrapper for tests).
+    /// Check if a pair qualifies and calculate its score (wrapper for tests).
     /// A pair must have:
     /// 1. USDT perpetual futures available
     /// 2. Spot margin trading enabled for hedging
@@ -358,7 +487,7 @@ impl MarketScanner {
         spot_margin_map: &HashMap<String, &SpotSymbolInfo>,
         margin_asset_map: &HashMap<String, &MarginAsset>,
     ) -> Option<QualifiedPair> {
-        self.qualify_pair_with_reason(
+        self.qualify_pair_with_details(
             funding,
             volume_map,
             spread_map,
