@@ -10,22 +10,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Binance API credentials
+    #[serde(default)]
     pub binance: BinanceConfig,
     /// Capital allocation settings
+    #[serde(default)]
     pub capital: CapitalConfig,
     /// Risk management parameters
+    #[serde(default)]
     pub risk: RiskConfig,
     /// Pair selection criteria
+    #[serde(default)]
     pub pair_selection: PairSelectionConfig,
     /// Execution parameters
+    #[serde(default)]
     pub execution: ExecutionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceConfig {
     /// API key for authentication
+    #[serde(default)]
     pub api_key: String,
     /// Secret key for signing requests
+    #[serde(default)]
     pub secret_key: String,
     /// Use testnet instead of production
     #[serde(default)]
@@ -357,6 +364,74 @@ impl Default for Config {
                 slippage_tolerance: default_slippage_tolerance(),
                 order_timeout_secs: default_order_timeout(),
             },
+        }
+    }
+}
+
+impl Default for BinanceConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            secret_key: String::new(),
+            testnet: false,
+        }
+    }
+}
+
+impl Default for CapitalConfig {
+    fn default() -> Self {
+        Self {
+            max_utilization: default_max_utilization(),
+            reserve_buffer: default_reserve_buffer(),
+            min_position_size: default_min_position_size(),
+            rebalance_threshold: default_rebalance_threshold(),
+        }
+    }
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            max_drawdown: default_max_drawdown(),
+            min_margin_ratio: default_min_margin_ratio(),
+            max_single_position: default_max_single_position(),
+            min_holding_period_hours: default_min_holding_period_hours(),
+            min_yield_advantage: default_min_yield_advantage(),
+            max_unprofitable_hours: default_max_unprofitable_hours(),
+            min_expected_yield: default_min_expected_yield(),
+            grace_period_hours: default_grace_period_hours(),
+            max_funding_deviation: default_max_funding_deviation(),
+            max_loss_usd: default_max_loss_usd(),
+            max_negative_apy: default_max_negative_apy(),
+            max_errors_per_minute: default_max_errors_per_minute(),
+            max_consecutive_failures: default_max_consecutive_failures(),
+            emergency_delta_drift: default_emergency_delta_drift(),
+            max_consecutive_risk_cycles: default_max_consecutive_risk_cycles(),
+        }
+    }
+}
+
+impl Default for PairSelectionConfig {
+    fn default() -> Self {
+        Self {
+            min_volume_24h: default_min_volume(),
+            min_funding_rate: default_min_funding_rate(),
+            max_spread: default_max_spread(),
+            min_open_interest: default_min_open_interest(),
+            max_positions: default_max_positions(),
+            default_borrow_rate: default_borrow_rate(),
+            min_net_funding: default_min_net_funding(),
+        }
+    }
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            default_leverage: default_leverage(),
+            max_leverage: default_max_leverage(),
+            slippage_tolerance: default_slippage_tolerance(),
+            order_timeout_secs: default_order_timeout(),
         }
     }
 }
