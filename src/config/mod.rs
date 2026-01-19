@@ -219,7 +219,11 @@ fn default_borrow_rate() -> Decimal {
 }
 
 fn default_min_net_funding() -> Decimal {
-    Decimal::new(1, 4) // 0.0001 (0.01%) minimum net funding per 8h after borrow costs
+    // With ~0.04% taker fee per side, round-trip cost is ~0.08%
+    // Minimum 24h hold (3 funding cycles) to be profitable:
+    // Required: 0.08% fees / 3 cycles = 0.027% per cycle minimum
+    // Set to 0.03% to ensure profitability with some buffer
+    Decimal::new(3, 4) // 0.0003 (0.03%) minimum net funding per 8h after borrow costs
 }
 
 fn default_leverage() -> u8 {

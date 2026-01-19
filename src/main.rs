@@ -757,6 +757,27 @@ async fn main() -> Result<()> {
                                 if result.success {
                                     info!("✅ [EXECUTE] Entered position for {}", result.symbol);
                                     metrics.positions_entered += 1;
+
+                                    // CRITICAL: Register position with risk orchestrator for monitoring
+                                    // This was missing, causing "Active Positions: X, Tracked: 0" discrepancy
+                                    let entry = PositionEntry {
+                                        symbol: alloc.symbol.clone(),
+                                        entry_price: price,
+                                        quantity: result
+                                            .futures_order
+                                            .as_ref()
+                                            .map(|o| o.executed_qty)
+                                            .unwrap_or(alloc.target_size_usdt / price),
+                                        position_value: alloc.target_size_usdt,
+                                        expected_funding_rate: alloc.funding_rate,
+                                        entry_fees: alloc.target_size_usdt * dec!(0.0004),
+                                        opened_at: None,
+                                    };
+                                    risk_orchestrator.open_position(entry);
+                                    info!(
+                                        "   📊 Registered with risk tracker: {} @ ${:.2}",
+                                        alloc.symbol, price
+                                    );
                                 } else {
                                     error!(
                                         "❌ [EXECUTE] Failed to enter {}: {:?}",
