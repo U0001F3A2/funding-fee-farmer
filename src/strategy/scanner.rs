@@ -228,28 +228,21 @@ impl MarketScanner {
         let borrow_rate = margin_asset.and_then(|a| a.margin_interest_rate);
 
         // For negative funding rates, we need to short spot (borrow base asset)
-        // CRITICAL: If we don't have real borrow rate data, reject the pair
-        // We can't rely on fallback rates - they're often too optimistic and lead to losses
+        // Check that the asset is in the margin system and is borrowable.
+        // Note: We use fallback rates if actual rate data is unavailable (common since
+        // /sapi/v1/margin/allAssets doesn't include interest rates).
         if funding.funding_rate < Decimal::ZERO {
             if margin_asset.is_none() {
                 trace!(
                     symbol,
                     base_asset,
                     funding_rate = %funding.funding_rate,
-                    "Rejecting: negative funding requires borrowing, but no margin data available"
+                    "Rejecting: negative funding requires borrowing, but asset not in margin system"
                 );
                 return Err(RejectReason::NotBorrowable);
             }
-            // Even if margin asset exists, require actual borrow rate data
-            if borrow_rate.is_none() {
-                trace!(
-                    symbol,
-                    base_asset,
-                    funding_rate = %funding.funding_rate,
-                    "Rejecting: negative funding requires borrowing, but no borrow rate data"
-                );
-                return Err(RejectReason::NotBorrowable);
-            }
+            // Asset is borrowable - we'll use fallback rates if actual rate is unavailable
+            // The net funding check below will still reject if borrow costs are too high
         }
 
         // Get volume
