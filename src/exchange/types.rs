@@ -243,6 +243,9 @@ pub struct QualifiedPair {
     /// Base asset (e.g., "BTC")
     pub base_asset: String,
     pub funding_rate: Decimal,
+    /// Next funding settlement time (milliseconds since epoch)
+    /// Used for JIT entry - some pairs have 4h intervals, others 8h
+    pub next_funding_time: i64,
     pub volume_24h: Decimal,
     pub spread: Decimal,
     pub open_interest: Decimal,

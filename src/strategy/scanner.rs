@@ -463,6 +463,7 @@ impl MarketScanner {
             spot_symbol,
             base_asset,
             funding_rate: funding.funding_rate,
+            next_funding_time: funding.funding_time,
             volume_24h: volume,
             spread,
             open_interest: Decimal::ZERO,

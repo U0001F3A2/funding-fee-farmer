@@ -502,9 +502,54 @@ async fn main() -> Result<()> {
                 &current_positions,
             );
 
-            if !allocations.is_empty() {
-                info!("💰 [ALLOCATE] {} new positions to enter", allocations.len());
-                for alloc in &allocations {
+            // ═══════════════════════════════════════════════════════════════
+            // JIT Entry Window Check (Per-Symbol)
+            // Only enter new positions within X minutes of funding settlement
+            // This reduces pre-first-funding borrow interest and confirms rate
+            // NOTE: Some pairs have 4h funding intervals, others 8h - we check per symbol
+            // ═══════════════════════════════════════════════════════════════
+            let entry_window_seconds = config.risk.entry_window_minutes as i64 * 60;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+
+            // Build lookup for next funding time per symbol
+            let funding_times: HashMap<String, i64> = qualified_pairs
+                .iter()
+                .map(|p| (p.symbol.clone(), p.next_funding_time))
+                .collect();
+
+            // Filter allocations to only those within their entry window
+            let (ready_allocations, waiting_allocations): (Vec<_>, Vec<_>) = allocations
+                .iter()
+                .partition(|alloc| {
+                    if entry_window_seconds == 0 {
+                        return true; // JIT disabled, enter anytime
+                    }
+                    let next_funding = funding_times.get(&alloc.symbol).copied().unwrap_or(0);
+                    if next_funding == 0 {
+                        return true; // Unknown funding time, allow entry
+                    }
+                    let seconds_to_funding = (next_funding - now_ms) / 1000;
+                    seconds_to_funding <= entry_window_seconds
+                });
+
+            // Log waiting pairs
+            for alloc in &waiting_allocations {
+                let next_funding = funding_times.get(&alloc.symbol).copied().unwrap_or(0);
+                let seconds_to_funding = (next_funding - now_ms) / 1000;
+                let minutes_to_funding = seconds_to_funding / 60;
+                let minutes_to_window = minutes_to_funding - config.risk.entry_window_minutes as i64;
+                info!(
+                    "⏳ [JIT] {} - {} min until funding, waiting {} min before entry",
+                    alloc.symbol,
+                    minutes_to_funding,
+                    minutes_to_window
+                );
+            }
+
+            if !ready_allocations.is_empty() {
+                info!("💰 [ALLOCATE] {} positions ready to enter ({} waiting for window)",
+                    ready_allocations.len(), waiting_allocations.len());
+                for alloc in &ready_allocations {
                     info!(
                         "   {} | Size: ${:.2} | Leverage: {}x | Funding: {:.4}%",
                         alloc.symbol,
@@ -527,7 +572,7 @@ async fn main() -> Result<()> {
                         .update_market_data(funding_rates, prices.clone())
                         .await;
 
-                    for alloc in allocations.iter().take(2) {
+                    for alloc in ready_allocations.iter().take(2) {
                         // Limit to top 2 for MVP
                         let price = match prices.get(&alloc.symbol).copied() {
                             Some(p) if p > Decimal::ZERO => p,

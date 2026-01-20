@@ -432,6 +432,7 @@ impl<D: DataLoader> BacktestEngine<D> {
                     spot_symbol: s.symbol.clone(),
                     base_asset,
                     funding_rate: s.funding_rate,
+                    next_funding_time: 0, // Not used in backtesting (processes at funding intervals)
                     volume_24h: s.volume_24h,
                     spread: s.spread,
                     open_interest: s.open_interest,

@@ -74,6 +74,12 @@ pub struct RiskConfig {
     #[serde(default = "default_max_single_position")]
     pub max_single_position: Decimal,
 
+    // Position entry timing
+    /// Minutes before funding settlement to allow new position entry (0 = anytime)
+    /// JIT entry reduces borrow interest and confirms funding rate before entry
+    #[serde(default = "default_entry_window_minutes")]
+    pub entry_window_minutes: u32,
+
     // Position holding rules
     /// Minimum hours to hold a position before considering exit (to cover trading fees)
     #[serde(default = "default_min_holding_period_hours")]
@@ -242,6 +248,11 @@ fn default_order_timeout() -> u64 {
     30
 }
 
+// Position entry timing defaults
+fn default_entry_window_minutes() -> u32 {
+    30 // Enter positions within 30 minutes of funding settlement (0 = anytime)
+}
+
 // Position holding rules defaults
 fn default_min_holding_period_hours() -> u32 {
     16 // Minimum 16h hold (2 funding cycles) to ensure fees are covered
@@ -351,6 +362,7 @@ impl Default for Config {
                 max_drawdown: default_max_drawdown(),
                 min_margin_ratio: default_min_margin_ratio(),
                 max_single_position: default_max_single_position(),
+                entry_window_minutes: default_entry_window_minutes(),
                 min_holding_period_hours: default_min_holding_period_hours(),
                 min_yield_advantage: default_min_yield_advantage(),
                 max_unprofitable_hours: default_max_unprofitable_hours(),
@@ -411,6 +423,7 @@ impl Default for RiskConfig {
             max_drawdown: default_max_drawdown(),
             min_margin_ratio: default_min_margin_ratio(),
             max_single_position: default_max_single_position(),
+            entry_window_minutes: default_entry_window_minutes(),
             min_holding_period_hours: default_min_holding_period_hours(),
             min_yield_advantage: default_min_yield_advantage(),
             max_unprofitable_hours: default_max_unprofitable_hours(),

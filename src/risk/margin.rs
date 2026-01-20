@@ -314,6 +314,7 @@ mod tests {
             max_drawdown: dec!(0.05),
             min_margin_ratio: dec!(3.0),
             max_single_position: dec!(0.30),
+            entry_window_minutes: 0,
             min_holding_period_hours: 24,
             min_yield_advantage: dec!(0.05),
             max_unprofitable_hours: 12,

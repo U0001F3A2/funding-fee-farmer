@@ -405,6 +405,7 @@ mod tests {
                 max_drawdown: dec!(0.05),
                 min_margin_ratio: dec!(3),
                 max_single_position: dec!(0.30),
+                entry_window_minutes: 0,
                 min_holding_period_hours: 24,
                 min_yield_advantage: dec!(0.05),
                 max_unprofitable_hours: 12,
@@ -429,6 +430,7 @@ mod tests {
             spot_symbol: symbol.to_string(),
             base_asset,
             funding_rate,
+            next_funding_time: 0, // Not used in allocation tests
             volume_24h: dec!(1_000_000_000),
             spread: dec!(0.0001),
             open_interest: dec!(500_000_000),

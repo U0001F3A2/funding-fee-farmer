@@ -229,6 +229,7 @@ impl RiskOrchestrator {
             max_drawdown: config.max_drawdown,
             min_margin_ratio: config.min_margin_ratio,
             max_single_position: config.max_single_position,
+            entry_window_minutes: 0, // Not used by risk orchestrator
             min_holding_period_hours: config.min_holding_period_hours,
             min_yield_advantage: config.min_yield_advantage,
             max_unprofitable_hours: config.max_unprofitable_hours,
