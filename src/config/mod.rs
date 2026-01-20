@@ -244,11 +244,11 @@ fn default_order_timeout() -> u64 {
 
 // Position holding rules defaults
 fn default_min_holding_period_hours() -> u32 {
-    24 // Minimum 24h hold to ensure funding fees exceed trading costs
+    16 // Minimum 16h hold (2 funding cycles) to ensure fees are covered
 }
 
 fn default_min_yield_advantage() -> Decimal {
-    Decimal::new(5, 2) // 0.05 (5%) - new position must yield 5%+ more to justify switch
+    Decimal::new(2, 2) // 0.02 (2%) - new position must yield 2%+ more to justify switch
 }
 
 // Position loss detection defaults

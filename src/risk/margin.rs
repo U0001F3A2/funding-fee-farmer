@@ -728,7 +728,7 @@ mod tests {
         maintenance_rates.insert("BTCUSDT".to_string(), dec!(0.004));
         maintenance_rates.insert("ETHUSDT".to_string(), dec!(0.004));
 
-        let (health, position_health) =
+        let (health, _position_health) =
             monitor.check_positions(&positions, dec!(50000), &maintenance_rates);
 
         // BTC: 1000 / (50000 * 0.004) = 1000 / 200 = 5 -> Green

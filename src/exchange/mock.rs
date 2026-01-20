@@ -483,12 +483,18 @@ impl MockBinanceClient {
     }
 
     /// Export current state for persistence.
+    /// Filters out ghost positions (closed positions with zero quantities).
     pub async fn export_state(&self) -> PersistedState {
         let state = self.state.read().await;
 
+        // Filter out ghost positions (both futures and spot qty are zero)
         let positions = state
             .positions
             .iter()
+            .filter(|(_, pos)| {
+                // Only keep positions that have actual holdings
+                pos.futures_qty != Decimal::ZERO || pos.spot_qty != Decimal::ZERO
+            })
             .map(|(symbol, pos)| {
                 (
                     symbol.clone(),

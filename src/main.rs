@@ -12,8 +12,8 @@ use funding_fee_farmer::config::Config;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
 use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
-    LiquidationAction, MarginHealth, MarginMonitor, PositionEntry, RiskAlertType, RiskOrchestrator,
-    RiskOrchestratorConfig,
+    LiquidationAction, MarginHealth, MarginMonitor, PositionAction, PositionEntry, RiskAlertType,
+    RiskOrchestrator, RiskOrchestratorConfig,
 };
 use funding_fee_farmer::strategy::{
     CapitalAllocator, HedgeRebalancer, MarginContext, MarketScanner, OrderExecutor, RebalanceConfig,
@@ -289,12 +289,29 @@ async fn main() -> Result<()> {
 
     // Register restored positions with risk orchestrator's position tracker
     // This is CRITICAL for auto-close logic to evaluate existing positions
-    if !restored_positions.is_empty() {
+    // Filter out ghost positions (closed positions with zero quantities)
+    let active_restored_positions: Vec<_> = restored_positions
+        .iter()
+        .filter(|(symbol, pos)| {
+            if pos.futures_qty == Decimal::ZERO && pos.spot_qty == Decimal::ZERO {
+                info!(
+                    "📂 [PERSISTENCE] Skipping ghost position {} (already closed)",
+                    symbol
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if !active_restored_positions.is_empty() {
         info!(
-            "📂 [PERSISTENCE] Registering {} restored positions with risk tracker",
-            restored_positions.len()
+            "📂 [PERSISTENCE] Registering {} active restored positions with risk tracker (skipped {} ghost positions)",
+            active_restored_positions.len(),
+            restored_positions.len() - active_restored_positions.len()
         );
-        for (symbol, pos) in &restored_positions {
+        for (symbol, pos) in active_restored_positions {
             // Calculate position value from futures side (main position)
             let position_value = pos.futures_qty.abs() * pos.futures_entry_price;
 
@@ -819,9 +836,22 @@ async fn main() -> Result<()> {
             );
 
             // Filter reductions based on minimum holding period and yield advantage
+            // Exception: ForceExit from risk orchestrator bypasses holding protection
             let reductions: Vec<_> = candidate_reductions
                 .into_iter()
                 .filter(|reduction| {
+                    // Check if risk orchestrator wants to force exit this position
+                    let position_action = risk_orchestrator.evaluate_position(&reduction.symbol);
+                    if matches!(position_action, PositionAction::ForceExit { .. }) {
+                        if let PositionAction::ForceExit { reason } = position_action {
+                            info!(
+                                "🚨 [FORCE-EXIT] {} bypassing holding protection: {}",
+                                reduction.symbol, reason
+                            );
+                        }
+                        return true; // Allow reduction - risk override
+                    }
+
                     // Check if position is within minimum holding period
                     if let Some(tracked) = risk_orchestrator.get_tracked_position(&reduction.symbol) {
                         let within_holding = tracked.is_within_holding_period(
