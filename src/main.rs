@@ -9,7 +9,6 @@ use funding_fee_farmer::backtest::{
     BacktestConfig, BacktestEngine, CsvDataLoader, DataLoader, ParameterSpace, SweepRunner,
 };
 use funding_fee_farmer::config::Config;
-use funding_fee_farmer::exchange::hyperliquid::HyperliquidClient;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
 use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
@@ -17,8 +16,7 @@ use funding_fee_farmer::risk::{
     RiskOrchestrator, RiskOrchestratorConfig,
 };
 use funding_fee_farmer::strategy::{
-    CapitalAllocator, CrossVenueScanner, HedgeRebalancer, MarginContext, MarketScanner,
-    OrderExecutor, RebalanceConfig,
+    CapitalAllocator, HedgeRebalancer, MarginContext, MarketScanner, OrderExecutor, RebalanceConfig,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -105,17 +103,6 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
-
-    /// Show cross-venue funding rate arbitrage opportunities (Hyperliquid vs Binance)
-    CrossVenue {
-        /// Minimum 8h spread to display (e.g., 0.001 = 0.1%)
-        #[arg(short, long, default_value = "0.001")]
-        min_spread: f64,
-
-        /// Maximum number of results to show
-        #[arg(short = 'n', long, default_value = "20")]
-        limit: usize,
-    },
 }
 
 /// Trading mode: Live (real money) or Mock (paper trading).
@@ -194,9 +181,6 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Status { db, verbose }) => {
             return show_status(&db, verbose);
-        }
-        Some(Commands::CrossVenue { min_spread, limit }) => {
-            return run_cross_venue_scan(min_spread, limit).await;
         }
         None => {
             // Default: run trading mode
@@ -2712,80 +2696,6 @@ fn show_status(db_path: &str, verbose: bool) -> Result<()> {
     }
 
     println!();
-    Ok(())
-}
-
-/// Run cross-venue funding rate comparison scan.
-async fn run_cross_venue_scan(min_spread: f64, limit: usize) -> Result<()> {
-    println!();
-    println!("╔════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║     Cross-Venue Funding Rate Arbitrage Scanner (Hyperliquid vs Binance)        ║");
-    println!("╚════════════════════════════════════════════════════════════════════════════════╝");
-    println!();
-
-    // Create clients
-    let binance_config = funding_fee_farmer::config::BinanceConfig::default();
-    let binance = BinanceClient::new(&binance_config)?;
-    let hyperliquid = HyperliquidClient::new()?;
-
-    // Create scanner with threshold
-    let min_spread_decimal = Decimal::from_f64_retain(min_spread).unwrap_or(dec!(0.001));
-    let scanner = CrossVenueScanner::new(min_spread_decimal);
-
-    println!("Fetching funding rates from both venues...");
-    let spreads = scanner.scan(&binance, &hyperliquid).await?;
-
-    if spreads.is_empty() {
-        println!();
-        println!("No arbitrage opportunities found above {:.2}% spread threshold.", min_spread * 100.0);
-        println!();
-        return Ok(());
-    }
-
-    println!();
-    println!(
-        "Found {} opportunities with spread >= {:.2}%",
-        spreads.len(),
-        min_spread * 100.0
-    );
-    println!();
-
-    // Print header (using venue short codes from first opportunity)
-    let venue_a_name = spreads.first().map(|s| s.venue_a.short_code()).unwrap_or("A");
-    let venue_b_name = spreads.first().map(|s| s.venue_b.short_code()).unwrap_or("B");
-
-    println!(
-        "{:<10} {:>12} {:>12} {:>12} {:>14} {:>24}",
-        "Symbol", format!("{} (8h)", venue_a_name), format!("{} (8h)", venue_b_name), "Spread", "APY", "Direction"
-    );
-    println!("{}", "─".repeat(90));
-
-    // Print spreads
-    for opp in spreads.iter().take(limit) {
-        let direction = format!(
-            "Long {} / Short {}",
-            opp.long_venue().short_code(),
-            opp.short_venue().short_code()
-        );
-
-        let venue_a_pct = opp.venue_a_funding_8h * dec!(100);
-        let venue_b_pct = opp.venue_b_funding_8h * dec!(100);
-        let spread_pct = opp.spread_8h * dec!(100);
-        let apy_pct = opp.spread_annualized * dec!(100);
-
-        println!(
-            "{:<10} {:>11.4}% {:>11.4}% {:>11.4}% {:>13.1}% {:>24}",
-            opp.base_asset, venue_a_pct, venue_b_pct, spread_pct, apy_pct, direction
-        );
-    }
-
-    println!("{}", "─".repeat(90));
-    println!();
-    println!("Note: Positive spread = {} higher rate (short {} profitable)", venue_a_name, venue_a_name);
-    println!("      Negative spread = {} higher rate (long {} profitable)", venue_b_name, venue_a_name);
-    println!("      APY assumes continuous 8h compounding");
-    println!();
-
     Ok(())
 }
 
