@@ -980,7 +980,11 @@ async fn main() -> Result<()> {
                 }
 
                 if trading_mode == TradingMode::Mock {
-                    let prices = fetch_prices(&real_client, &qualified_pairs).await;
+                    // Fetch prices for reduction symbols specifically (not just qualified_pairs)
+                    // This fixes orphaned positions where the symbol no longer qualifies
+                    let reduction_symbols: Vec<String> =
+                        reductions.iter().map(|r| r.symbol.clone()).collect();
+                    let prices = fetch_prices_for_symbols(&real_client, &reduction_symbols).await;
 
                     for reduction in &reductions {
                         let price = match prices.get(&reduction.symbol).copied() {
@@ -1090,7 +1094,10 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     // LIVE TRADING: Execute reductions
-                    let prices = fetch_prices(&real_client, &qualified_pairs).await;
+                    // Fetch prices for reduction symbols (not qualified_pairs) to handle orphaned positions
+                    let reduction_symbols: Vec<String> =
+                        reductions.iter().map(|r| r.symbol.clone()).collect();
+                    let prices = fetch_prices_for_symbols(&real_client, &reduction_symbols).await;
                     let positions = real_client.get_positions().await.unwrap_or_default();
 
                     for reduction in &reductions {
@@ -1153,7 +1160,11 @@ async fn main() -> Result<()> {
                     .iter()
                     .map(|p| (p.symbol.clone(), p.funding_rate))
                     .collect();
-                let prices = fetch_prices(&real_client, &qualified_pairs).await;
+                // Fetch prices for all position symbols (not just qualified_pairs)
+                // to properly rebalance orphaned positions
+                let position_symbols: Vec<String> =
+                    positions.iter().map(|p| p.symbol.clone()).collect();
+                let prices = fetch_prices_for_symbols(&real_client, &position_symbols).await;
 
                 // Collect positions that need to be closed due to funding direction flip
                 let mut flip_positions_to_close: Vec<String> = Vec::new();
