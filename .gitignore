@@ -43,3 +43,5 @@ data/
 # EC2 host (local reference)
 .ec2_host
 venv/
+__pycache__/
+*.pyc
