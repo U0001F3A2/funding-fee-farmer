@@ -205,7 +205,7 @@ fn default_min_volume() -> Decimal {
 }
 
 fn default_min_funding_rate() -> Decimal {
-    Decimal::new(5, 4) // 0.0005 (0.05%) - optimal threshold based on 6-year backtest analysis
+    Decimal::new(1, 3) // 0.001 (0.1%) - higher threshold to ensure profitable entries
 }
 
 fn default_max_spread() -> Decimal {
