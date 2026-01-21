@@ -463,15 +463,36 @@ async fn main() -> Result<()> {
         // PHASE 3: Capital Allocation
         // ═══════════════════════════════════════════════════════════════
         if !qualified_pairs.is_empty() {
-            // Get prices first so we can convert position quantities to USDT values
-            let prices = fetch_prices(&real_client, &qualified_pairs).await;
+            // Get current position symbols to include in price fetch
+            // This ensures orphaned positions (not in qualified_pairs) still get correct prices
+            let position_symbols: Vec<String> = if trading_mode == TradingMode::Mock {
+                mock_client
+                    .get_delta_neutral_positions()
+                    .await
+                    .into_iter()
+                    .map(|p| p.symbol)
+                    .collect()
+            } else {
+                Vec::new() // Real positions handled separately below
+            };
+
+            // Combine qualified pair symbols with position symbols for price fetch
+            let mut all_symbols: Vec<String> = qualified_pairs.iter().map(|p| p.symbol.clone()).collect();
+            for sym in &position_symbols {
+                if !all_symbols.contains(sym) {
+                    all_symbols.push(sym.clone());
+                }
+            }
+
+            // Fetch prices for all symbols (qualified + current positions)
+            let prices = fetch_prices_for_symbols(&real_client, &all_symbols).await;
 
             // CRITICAL: Check if price fetch failed completely
             // If no prices returned, skip trading to avoid silent failures
             if prices.is_empty() {
                 error!(
-                    "❌ [PRICES] Failed to fetch prices for {} pairs - API may be unavailable. Skipping trading cycle.",
-                    qualified_pairs.len()
+                    "❌ [PRICES] Failed to fetch prices for {} symbols - API may be unavailable. Skipping trading cycle.",
+                    all_symbols.len()
                 );
                 metrics.errors_count += 1;
                 risk_orchestrator.record_error("Price fetch returned empty - API unavailable");
@@ -488,7 +509,10 @@ async fn main() -> Result<()> {
                     .await
                     .into_iter()
                     .map(|p| {
-                        let price = prices.get(&p.symbol).copied().unwrap_or(Decimal::ONE);
+                        let price = prices.get(&p.symbol).copied().unwrap_or_else(|| {
+                            warn!("⚠️ No price found for position {}, using entry price fallback", p.symbol);
+                            Decimal::ONE // This shouldn't happen now, but log a warning if it does
+                        });
                         let position_value_usdt = p.futures_qty.abs() * price;
                         (p.symbol, position_value_usdt)
                     })
@@ -2249,15 +2273,24 @@ async fn fetch_real_positions(client: &BinanceClient) -> Result<HashMap<String, 
     }
 }
 
-/// Fetch current prices from real client.
+/// Fetch current prices from real client for qualified pairs.
 async fn fetch_prices(
     client: &BinanceClient,
     pairs: &[funding_fee_farmer::exchange::QualifiedPair],
 ) -> HashMap<String, Decimal> {
+    let symbols: Vec<String> = pairs.iter().map(|p| p.symbol.clone()).collect();
+    fetch_prices_for_symbols(client, &symbols).await
+}
+
+/// Fetch current prices from real client for specific symbols.
+async fn fetch_prices_for_symbols(
+    client: &BinanceClient,
+    symbols: &[String],
+) -> HashMap<String, Decimal> {
     match client.get_book_tickers().await {
         Ok(tickers) => tickers
             .into_iter()
-            .filter(|t| pairs.iter().any(|p| p.symbol == t.symbol))
+            .filter(|t| symbols.iter().any(|s| s == &t.symbol))
             .map(|t| {
                 let mid_price = (t.bid_price + t.ask_price) / dec!(2);
                 (t.symbol, mid_price)
