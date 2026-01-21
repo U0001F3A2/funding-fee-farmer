@@ -14,11 +14,13 @@
 mod client;
 pub mod hyperliquid;
 pub mod mock;
+mod traits;
 mod types;
 mod websocket;
 
 pub use client::BinanceClient;
 pub use hyperliquid::HyperliquidClient;
 pub use mock::MockBinanceClient;
+pub use traits::{FundingDataProvider, Venue, VenueAsset};
 pub use types::*;
 pub use websocket::BinanceWebSocket;

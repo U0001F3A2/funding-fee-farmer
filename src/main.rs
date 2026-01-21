@@ -9,7 +9,7 @@ use funding_fee_farmer::backtest::{
     BacktestConfig, BacktestEngine, CsvDataLoader, DataLoader, ParameterSpace, SweepRunner,
 };
 use funding_fee_farmer::config::Config;
-use funding_fee_farmer::exchange::hyperliquid::{HyperliquidClient, SpreadDirection};
+use funding_fee_farmer::exchange::hyperliquid::HyperliquidClient;
 use funding_fee_farmer::exchange::{BinanceClient, MockBinanceClient};
 use funding_fee_farmer::persistence::PersistenceManager;
 use funding_fee_farmer::risk::{
@@ -2717,36 +2717,39 @@ async fn run_cross_venue_scan(min_spread: f64, limit: usize) -> Result<()> {
     );
     println!();
 
-    // Print header
+    // Print header (using venue short codes from first opportunity)
+    let venue_a_name = spreads.first().map(|s| s.venue_a.short_code()).unwrap_or("A");
+    let venue_b_name = spreads.first().map(|s| s.venue_b.short_code()).unwrap_or("B");
+
     println!(
         "{:<10} {:>12} {:>12} {:>12} {:>14} {:>24}",
-        "Symbol", "HL (8h)", "Binance", "Spread", "APY", "Direction"
+        "Symbol", format!("{} (8h)", venue_a_name), format!("{} (8h)", venue_b_name), "Spread", "APY", "Direction"
     );
     println!("{}", "─".repeat(90));
 
     // Print spreads
-    for spread in spreads.iter().take(limit) {
-        let direction = match spread.recommended_direction {
-            Some(SpreadDirection::LongHlShortOther) => "Long HL / Short Binance",
-            Some(SpreadDirection::ShortHlLongOther) => "Short HL / Long Binance",
-            None => "-",
-        };
+    for opp in spreads.iter().take(limit) {
+        let direction = format!(
+            "Long {} / Short {}",
+            opp.long_venue().short_code(),
+            opp.short_venue().short_code()
+        );
 
-        let hl_pct = spread.hl_funding_8h * dec!(100);
-        let bn_pct = spread.other_funding_8h * dec!(100);
-        let spread_pct = spread.spread_8h * dec!(100);
-        let apy_pct = spread.spread_annualized * dec!(100);
+        let venue_a_pct = opp.venue_a_funding_8h * dec!(100);
+        let venue_b_pct = opp.venue_b_funding_8h * dec!(100);
+        let spread_pct = opp.spread_8h * dec!(100);
+        let apy_pct = opp.spread_annualized * dec!(100);
 
         println!(
             "{:<10} {:>11.4}% {:>11.4}% {:>11.4}% {:>13.1}% {:>24}",
-            spread.hl_coin, hl_pct, bn_pct, spread_pct, apy_pct, direction
+            opp.base_asset, venue_a_pct, venue_b_pct, spread_pct, apy_pct, direction
         );
     }
 
     println!("{}", "─".repeat(90));
     println!();
-    println!("Note: Positive spread = HL higher rate (short HL profitable)");
-    println!("      Negative spread = Binance higher rate (long HL profitable)");
+    println!("Note: Positive spread = {} higher rate (short {} profitable)", venue_a_name, venue_a_name);
+    println!("      Negative spread = {} higher rate (long {} profitable)", venue_b_name, venue_a_name);
     println!("      APY assumes continuous 8h compounding");
     println!();
 

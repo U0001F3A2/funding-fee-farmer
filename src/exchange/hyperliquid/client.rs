@@ -243,6 +243,45 @@ impl Default for HyperliquidClient {
     }
 }
 
+// Implement the venue-agnostic trait for cross-venue comparisons
+use crate::exchange::traits::{FundingDataProvider, Venue, VenueAsset};
+use async_trait::async_trait;
+
+#[async_trait]
+impl FundingDataProvider for HyperliquidClient {
+    fn venue(&self) -> Venue {
+        Venue::Hyperliquid
+    }
+
+    fn funding_period_hours(&self) -> u32 {
+        1 // Hyperliquid settles funding hourly
+    }
+
+    async fn get_venue_assets(&self) -> anyhow::Result<Vec<VenueAsset>> {
+        let assets = self.get_assets().await?;
+
+        Ok(assets
+            .into_iter()
+            .map(|a| {
+                // Convert hourly rate to 8h equivalent for normalization
+                let funding_8h = a.funding_rate * dec!(8);
+                // Calculate OI in USD
+                let oi_usd = a.open_interest * a.mark_price;
+
+                VenueAsset::new(
+                    a.name.clone(),           // symbol (e.g., "BTC")
+                    a.name,                   // base_asset (same for HL)
+                    funding_8h,
+                    a.volume_24h,
+                    a.mark_price,
+                )
+                .with_open_interest(oi_usd)
+                // Note: HL doesn't provide bid-ask spread in this API
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

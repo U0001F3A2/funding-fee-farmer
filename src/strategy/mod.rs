@@ -13,7 +13,7 @@ mod rebalancer;
 mod scanner;
 
 pub use allocator::{CapitalAllocator, PositionAllocation, PositionReduction};
-pub use cross_venue::CrossVenueScanner;
+pub use cross_venue::{CrossVenueConfig, CrossVenueOpportunity, CrossVenueScanner};
 pub use executor::{EntryResult, MarginContext, OrderExecutor};
 pub use rebalancer::{HedgeRebalancer, RebalanceAction, RebalanceConfig, RebalanceResult};
 pub use scanner::MarketScanner;
