@@ -1,6 +1,6 @@
 # Funding Fee Farmer
 
-High-performance delta-neutral funding fee farming on Binance Futures.
+High-performance delta-neutral funding fee farming on Binance Futures. -- pretty much not profitable, so use at your own risk.
 
 ## Overview
 
